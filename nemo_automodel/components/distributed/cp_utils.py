@@ -171,7 +171,7 @@ def make_cp_batch_and_ctx(
             num_chunks=num_chunks,
             seq_lens_padding_value=seq_lens_padding_value,
         )
-
+    batch.pop("qkv_format", None)
     if _get_mesh_size(cp_mesh) <= 1:
         return nullcontext, batch
 
