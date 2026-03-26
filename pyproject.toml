@@ -115,7 +115,7 @@ cuda = [
 cuda_source = [
     "bitsandbytes",
 ]
-extra = ["perceptron", "sentencepiece"]
+extra = ["flash-linear-attention", "perceptron", "sentencepiece"]
 fa = ["flash-attn<=2.8.3"]
 delta-databricks = [
     "deltalake>=1.0.0",  # For Delta Lake metadata
