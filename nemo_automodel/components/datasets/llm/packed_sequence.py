@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import logging
-
+from tqdm import tqdm
 import torch
 from datasets import Dataset
 from torch.nn import functional as F
@@ -244,7 +244,7 @@ def pack_dataset(
     # Calculate CP divisibility factor
     cp_divisibility_factor = 2 * cp_size if cp_size > 1 else 1
 
-    for sample in dataset:
+    for sample in tqdm(dataset, desc="Packing..."):
         input_ids, labels = sample["input_ids"], sample["labels"]
         if loss_mask := sample.pop("loss_mask", None):
             labels = _fill_labels_with_cross_entropy_ignore_idx(labels, loss_mask)
