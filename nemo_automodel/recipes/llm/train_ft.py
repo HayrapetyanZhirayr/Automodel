@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import math
 import pathlib
 import time
 from contextlib import nullcontext
@@ -136,6 +137,19 @@ def _get_num_thd_chunks(pp_enabled, cfg):
     if pp_enabled:
         return cfg.step_scheduler.local_batch_size // cfg.get("distributed.pipeline.pp_microbatch_size", 1)
     return 1
+
+
+def _format_duration(seconds: float) -> str:
+    """Format seconds as human-readable duration (e.g., '2h 30m', '45m', '30s')."""
+    if seconds < 0 or not math.isfinite(seconds):
+        return "?"
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h {int((seconds % 3600) // 60)}m"
+    return f"{int(seconds // 86400)}d {int((seconds % 86400) // 3600)}h"
 
 
 def build_model(
@@ -1650,9 +1664,33 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)
+
+        # ETA tracking: initialise on the first logged step so that checkpoint
+        # restarts (e.g. starting at step 1000) use real observed throughput
+        # rather than projecting from step 0.
+        if not hasattr(self, "_eta_start_step"):
+            self._eta_start_step: int = log_data.step
+            self._eta_start_time: float = time.monotonic()
+
+        max_steps = getattr(self.step_scheduler, "max_steps", None)
+        if max_steps is not None:
+            steps_done = log_data.step - self._eta_start_step
+            elapsed = time.monotonic() - self._eta_start_time
+            steps_left = max_steps - log_data.step
+            eta_str = (
+                _format_duration(elapsed / steps_done * steps_left)
+                if steps_done > 0
+                else "?"
+            )
+            step_info = f"{log_data.step}/{max_steps}"
+            eta_part = f" | eta {eta_str}"
+        else:
+            step_info = str(log_data.step)
+            eta_part = ""
+
         logging.info(
-            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
-                log_data.step,
+            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}{}".format(
+                step_info,
                 log_data.epoch,
                 log_data.metrics["loss"],
                 log_data.metrics["grad_norm"],
@@ -1661,6 +1699,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 log_data.metrics["tps"],
                 log_data.metrics["tps_per_gpu"],
                 log_data.metrics["num_label_tokens"],
+                eta_part,
             )
         )
         torch.cuda.reset_peak_memory_stats()
