@@ -11,6 +11,7 @@ export NETRC="$WANDB_CREDS_FILE"
 source "$VENV_DIR/bin/activate"
 export OMP_NUM_THREADS=16
 export MKL_NUM_THREADS=16
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # >>> IGNORE CHERRY PICKED WARNINGS >>>
 export PYTHONWARNINGS="\
