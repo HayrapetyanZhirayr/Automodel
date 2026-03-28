@@ -1601,14 +1601,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if not self.dist_env.is_main or log_data is None:
             return
 
+        _payload = log_data.to_dict()
+        for k in ["val_loss", "num_label_tokens", "tps_per_gpu", "tps", "mem"]:
+            if k in _payload:
+                _payload[f"{k}_{val_name.lstrip('_')}"] = _payload.pop(k)
+
         if wandb.run is not None:
-            wandb.log(log_data.to_dict() | {"val_name": val_name}, step=log_data.step)
+            wandb.log(_payload | {"val_name": val_name}, step=log_data.step)
 
         if self.mlflow_logger is not None:
-            self.mlflow_logger.log_metrics(log_data.to_dict(), step=log_data.step)
+            self.mlflow_logger.log_metrics(_payload, step=log_data.step)
 
         if self.comet_logger is not None:
-            self.comet_logger.log_metrics(log_data.to_dict() | {"val_name": val_name}, step=log_data.step)
+            self.comet_logger.log_metrics(_payload | {"val_name": val_name}, step=log_data.step)
 
         # JSONL validation log
         if not metric_logger is None:
