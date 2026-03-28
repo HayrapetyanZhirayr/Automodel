@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Union
 
 import torch
 import torch.nn as nn
@@ -35,6 +36,15 @@ from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+
+@dataclass
+class Qwen3NextCausalLMOutput:
+    logits: torch.Tensor
+    hidden_states: torch.Tensor | None = None
+
+    def __contains__(self, key: str) -> bool:
+        return hasattr(self, key) and getattr(self, key) is not None
 
 
 class Block(nn.Module):
@@ -285,8 +295,9 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
         **attn_kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | Qwen3NextCausalLMOutput:
         if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, attn_kwargs
@@ -300,9 +311,22 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             padding_mask=padding_mask,
             **attn_kwargs,
         )
-        logits = self.lm_head(hidden) if self.lm_head else hidden
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+
+        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
+            logits = self.lm_head(hidden) if self.lm_head else hidden
+        else:
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            logits = self.lm_head(hidden[:, slice_indices, :]) if self.lm_head else hidden[:, slice_indices, :]
+
+        is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
+        if is_thd:
             logits = logits.unsqueeze(0)
+
+        if isinstance(logits_to_keep, int) and logits_to_keep > 0:
+            if is_thd:
+                hidden = hidden.unsqueeze(0)
+            return Qwen3NextCausalLMOutput(logits=logits, hidden_states=hidden)
+
         return logits
 
     @torch.no_grad()

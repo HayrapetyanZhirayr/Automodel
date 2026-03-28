@@ -14,7 +14,8 @@
 
 """Qwen3.5-MoE (VL) NeMo Automodel support."""
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Union
 
 import torch
 import torch.nn as nn
@@ -60,7 +61,7 @@ from nemo_automodel.components.models.common import BackendConfig, initialize_li
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
-from nemo_automodel.components.models.qwen3_next.model import Block
+from nemo_automodel.components.models.qwen3_next.model import Block, Qwen3NextCausalLMOutput
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
@@ -471,8 +472,9 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         padding_mask: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         cache_position: torch.Tensor | None = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: Any,
-    ):
+    ) -> torch.Tensor | Qwen3NextCausalLMOutput:
         # PP VLM support: retrieve pixel_values from stored chunks if not passed
         pixel_values = kwargs.get("pixel_values", None)
         image_grid_thw = kwargs.get("image_grid_thw", None)
@@ -504,7 +506,8 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                     kwargs["image_grid_thw"] = image_grid_thw
                     self._vlm_chunk_idx = chunk_idx + 1
 
-        if "qkv_format" in kwargs and kwargs["qkv_format"] == "thd":
+        is_thd = "qkv_format" in kwargs and kwargs["qkv_format"] == "thd"
+        if is_thd:
             input_ids, position_ids, padding_mask, kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, kwargs
             )
@@ -523,10 +526,14 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
         hidden_states = outputs.last_hidden_state
 
-        if self.lm_head is not None:
-            logits = self.lm_head(hidden_states)
+        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
+            logits = self.lm_head(hidden_states) if self.lm_head else hidden_states
         else:
-            logits = hidden_states
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            logits = self.lm_head(hidden_states[:, slice_indices, :]) if self.lm_head else hidden_states[:, slice_indices, :]
+
+        if isinstance(logits_to_keep, int) and logits_to_keep > 0:
+            return Qwen3NextCausalLMOutput(logits=logits, hidden_states=hidden_states)
 
         return logits
 
