@@ -427,6 +427,12 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
         # Replace HF text decoder with our NeMo backend
         text_config = config.text_config if hasattr(config, "text_config") else config
+
+        if "router_aux_loss_coef" in kwargs:
+            router_aux = kwargs.pop("router_aux_loss_coef")
+            if hasattr(text_config, "router_aux_loss_coef"):
+                setattr(text_config, "router_aux_loss_coef", router_aux)
+
         self.model.language_model = Qwen3_5MoeTextModelBackend(text_config, backend=self.backend, moe_config=moe_config)
 
         # Replace lm_head with NeMo backend linear
