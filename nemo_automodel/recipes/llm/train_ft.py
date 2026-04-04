@@ -33,7 +33,11 @@ from transformers import AutoConfig
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from wandb import Settings
 
-from nemo_automodel._transformers import NeMoAutoModelForCausalLM, NeMoAutoModelForSequenceClassification
+from nemo_automodel._transformers import (
+    NeMoAutoModelForCausalLM,
+    NeMoAutoModelForSequenceClassification,
+    NeMoAutoModelForImageTextToText,
+)
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.infrastructure import (
     apply_model_infrastructure,
@@ -241,6 +245,8 @@ def build_model(
         is_nemo_auto_model = cfg_model.get("_target_", None) in (
             NeMoAutoModelForCausalLM.from_config,
             NeMoAutoModelForCausalLM.from_pretrained,
+            NeMoAutoModelForImageTextToText.from_config,
+            NeMoAutoModelForImageTextToText.from_pretrained,
             NeMoAutoModelForSequenceClassification.from_config,
             NeMoAutoModelForSequenceClassification.from_pretrained,
         )
