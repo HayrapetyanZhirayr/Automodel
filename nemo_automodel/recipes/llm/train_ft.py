@@ -540,6 +540,7 @@ def build_dataloader(
                     packed_sequence_size=packed_sequence_size,
                     max_packs=getattr(cfg_ps, "max_packs", None),
                     padding_idx=getattr(tokenizer, "pad_token_id", 0),
+                    drop_long_samples=getattr(cfg_ps, "drop_long_samples", False),
                     cp_size=cp_size,
                 )
 
