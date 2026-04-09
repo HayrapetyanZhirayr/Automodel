@@ -13,6 +13,8 @@
 # limitations under the License.
 
 from .chat_dataset import ChatDataset  # noqa: F401
+from .chat_dataset_tokenized import ChatDatasetFromTokenized  # noqa: F401
+
 from .column_mapped_text_instruction_dataset import ColumnMappedTextInstructionDataset  # noqa: F401
 from .column_mapped_text_instruction_iterable_dataset import ColumnMappedTextInstructionIterableDataset  # noqa: F401
 from .delta_lake_dataset import (  # noqa: F401
@@ -35,6 +37,7 @@ __all__ = [
     "ColumnMappedTextInstructionDataset",
     "ColumnMappedTextInstructionIterableDataset",
     "ChatDataset",
+    "ChatDatasetFromTokenized",
     "DeltaLakeDataset",
     "is_delta_lake_path",
 ]

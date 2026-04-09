@@ -298,6 +298,32 @@ def format_prompt_completion(
     )
 
 
+def format_chat_template_from_tokenized(
+    
+    tokenizer: "PreTrainedTokenizer",
+    tokenized_chat: Dict[str, List[int]],
+    eos_token_id: int,
+    pad_token_id: int,
+    seq_length: Optional[int] = None,
+    padding: Union[str, bool] = "do_not_pad",
+    truncation: Union[str, bool] = "do_not_truncate",
+) -> Dict[str, List[int]]:
+
+    input_ids = tokenized_chat["input_ids"]
+    mask = tokenized_chat["assistant_masks"]
+
+    return _package_tokenized_example(
+        tokenizer=tokenizer,
+        input_ids=input_ids,
+        assistant_masks=mask,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        seq_length=seq_length,
+        truncation=truncation,
+        padding=padding,
+    )
+
+
 def format_chat_template(
     tokenizer: "PreTrainedTokenizer",
     formatted_text: List[Dict[str, str]],
