@@ -32,7 +32,8 @@ import argparse
 import json
 import os
 import shutil
-
+import re
+import glob
 import torch
 import torch.distributed as dist
 
@@ -45,6 +46,10 @@ from nemo_automodel.components.distributed.init_utils import (
     initialize_distributed,
 )
 
+_metadata_fn: str = "model.safetensors.index.json"
+SUFFIX = ".safetensors"
+_HF_WEIGHT_NUM_FILES_RE = re.compile(r"-of-(\d+)\.safetensors$", re.IGNORECASE)
+
 
 def copy_metadata_files(input_dir, output_dir):
     """
@@ -52,11 +57,91 @@ def copy_metadata_files(input_dir, output_dir):
     """
     for item_name in os.listdir(input_dir):
         if item_name == "fqn_to_file_index_mapping.json":
-            continue  # this is saved by the consolidation step
+            continue  # consolidation step may emit an updated mapping for output
         src_path = os.path.join(input_dir, item_name)
         dst_path = os.path.join(output_dir, item_name)
-        shutil.move(src_path, dst_path)
-    shutil.rmtree(input_dir, ignore_errors=True)
+        if os.path.isdir(src_path):
+            shutil.copytree(src_path, dst_path, dirs_exist_ok=True)
+        else:
+            shutil.copy2(src_path, dst_path)
+
+
+def infer_hf_safetensors_num_shards(model_dir: str):
+    """
+    Infer the Hugging Face weight shard count ``N`` (the ``of-NNNNN`` part) from a **local**
+    model directory.
+
+    Uses ``model.safetensors.index.json`` when present (parses ``weight_map`` basenames), else
+    globs ``model-*-of-*.safetensors``. Returns ``1`` if only ``model.safetensors`` exists.
+
+    Hub repo ids (non-paths) are not resolved offline — returns ``None``.
+
+    Args:
+        model_dir: Absolute or user path to a HF snapshot directory on disk.
+
+    Returns:
+        Shard count ``N``, or ``None`` if the path is not a directory or layout is unknown.
+    """
+    if not model_dir or not isinstance(model_dir, str):
+        return None
+    model_dir = os.path.expanduser(model_dir)
+    if not os.path.isdir(model_dir):
+        return None
+
+    index_path = os.path.join(model_dir, _metadata_fn)
+    if os.path.isfile(index_path):
+        with open(index_path, encoding="utf-8") as f:
+            index_obj = json.load(f)
+        weight_map = index_obj.get("weight_map") or {}
+        nums: set[int] = set()
+        for filename in weight_map.values():
+            base = os.path.basename(str(filename))
+            m = _HF_WEIGHT_NUM_FILES_RE.search(base)
+            if m:
+                nums.add(int(m.group(1)))
+        if nums:
+            return max(nums)
+
+    shard_files = glob.glob(os.path.join(model_dir, "model-*-of-*" + SUFFIX))
+    nums_glob: set[int] = set()
+    for path in shard_files:
+        m = _HF_WEIGHT_NUM_FILES_RE.search(os.path.basename(path))
+        if m:
+            nums_glob.add(int(m.group(1)))
+    if nums_glob:
+        return max(nums_glob)
+
+    if os.path.isfile(os.path.join(model_dir, "model" + SUFFIX)):
+        return 1
+
+    return None
+
+
+def spread_fqns_to_hf_file_indices(
+    fqn_to_index_mapping: dict[str, int],
+    num_files: int,
+) -> dict[str, int]:
+    """
+    Reassign each tensor FQN to a Hugging Face-style output file index in ``1 .. num_files``.
+
+    Values in the saved JSON from training often encode ``model-00001-of-00001``
+    per rank, so every value is ``1`` and consolidation produces a single huge file. This helper
+    spreads keys (stable sort by FQN, round-robin) so ``_gen_file_name`` yields
+    ``model-XXXXX-of-{num_files:05d}.safetensors`` with multiple shards.
+
+    Args:
+        fqn_to_index_mapping: Existing mapping (only keys are required; values are replaced).
+        num_files: Number of output safetensors files (must be >= 1).
+
+    Returns:
+        New mapping from FQN to 1-based file index.
+    """
+    if num_files < 1:
+        raise ValueError(f"num_files must be >= 1, got {num_files}")
+    keys = sorted(fqn_to_index_mapping.keys())
+    if num_files == 1:
+        return {fqn: 1 for fqn in keys}
+    return {fqn: (i % num_files) + 1 for i, fqn in enumerate(keys)}
 
 
 def parse_args() -> argparse.Namespace:
@@ -109,7 +194,7 @@ def main() -> None:
     backend = args.backend
     if backend == "auto":
         backend = "nccl" if torch.cuda.device_count() > 0 else "gloo"
-    initialize_distributed(backend)
+    initialize_distributed(backend, timeout_minutes=10)
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -118,11 +203,15 @@ def main() -> None:
 
     hf_metadata_dir = os.path.join(args.input_dir, ".hf_metadata")
 
-    if not os.path.exists(hf_metadata_dir) and not os.path.isdir(hf_metadata_dir):
+    if not os.path.exists(hf_metadata_dir) or not os.path.isdir(hf_metadata_dir):
         raise FileNotFoundError("Expected to find the .hf_metadata directory in the input directory.")
 
     with open(os.path.join(hf_metadata_dir, "fqn_to_file_index_mapping.json"), "r") as f:
         fqn_to_index_mapping = json.load(f)
+
+    num_output_shards = infer_hf_safetensors_num_shards(args.model_name)
+    if num_output_shards and num_output_shards > 1:
+        fqn_to_index_mapping = spread_fqns_to_hf_file_indices(fqn_to_index_mapping, num_output_shards)
 
     consolidate_safetensors_files_on_every_rank(
         args.input_dir,
