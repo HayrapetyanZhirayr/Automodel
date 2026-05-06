@@ -313,7 +313,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 device=teacher_device,
             )
             self.teacher_pp = None
-
+        import gc; gc.collect(); torch.cuda.empty_cache()
         logger.info("Teacher Model: " + str(self.teacher_model))
 
         # KD
