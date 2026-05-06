@@ -846,8 +846,14 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         if not self.dist_env.is_main or log_data is None:
             return
 
+        _payload = log_data.to_dict()
+        for k in ["val_loss", "ce_loss", "kd_loss", "num_label_tokens", "mem"]:
+            if k in _payload:
+                _payload[f"{k}_{val_name.lstrip('_')}"] = _payload.pop(k)
+        print(_payload)
+
         if wandb.run is not None:
-            wandb.log(log_data.to_dict() | {"val_name": val_name}, step=log_data.step)
+            wandb.log(_payload | {"val_name": val_name}, step=log_data.step)
 
         if not metric_logger is None:
             metric_logger.log(log_data)
