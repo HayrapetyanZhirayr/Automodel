@@ -812,7 +812,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 local_loss, _kd_loss, _ce_loss = self._forward_backward_step(
                     0,
                     batch,
-                    num_label_tokens=num_label_tokens,
+                    num_label_tokens=1,
                     num_batches=1,
                     is_train=False,
                 )
@@ -826,7 +826,9 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         kd_loss = self._dp_allreduce(kd_loss, include_cp=True).item()
         total_num_label_tokens = self._dp_allreduce(torch.tensor(total_num_label_tokens, dtype=torch.long)).item()
 
-        val_loss = total_loss / max(total_num_label_tokens, 1e-8)
+        val_loss = total_loss / total_num_label_tokens
+        ce_loss = ce_loss / total_num_label_tokens
+        kd_loss = kd_loss / total_num_label_tokens
         return MetricsSample(
             step=self.step_scheduler.step,
             epoch=self.step_scheduler.epoch,
