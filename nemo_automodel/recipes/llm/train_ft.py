@@ -1019,6 +1019,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             sdpa_method=self.cfg.get("sdpa_method", None),
         )
         self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
+        import gc; gc.collect(); torch.cuda.empty_cache()
 
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
             logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
