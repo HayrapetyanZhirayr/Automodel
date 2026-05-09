@@ -224,11 +224,12 @@ def _apply_preload_overrides(tp_size, cp_size, has_packed_sequence, attn_impleme
     if has_packed_sequence:
         if cp_size == 1:
             assert HAS_FA, "Flash Attention is not available"
-            attn_implementation = "flash_attention_2"
-            logger.warning(
-                "Packed sequence is supported only with Flash Attention. "
-                "Setting model's attn_implementation to flash_attention_2"
-            )
+            if attn_implementation != "flash_attention_2":
+                attn_implementation = "flash_attention_2"
+                logger.warning(
+                    "Packed sequence is supported only with Flash Attention. "
+                    "Setting model's attn_implementation to flash_attention_2"
+                )
         else:
             # TODO: support packed sequence with CP size > 1
             raise ValueError("Packed sequence is only supported with CP size 1")
