@@ -939,7 +939,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         torch.cuda.reset_peak_memory_stats()
         self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
         # setups logging and adds the rankfilter to logging
-        setup_logging()
+        setup_logging(filter_warning=False)
 
         apply_cache_compatibility_patches()
         apply_te_patches()
