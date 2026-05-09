@@ -407,7 +407,7 @@ def apply_model_infrastructure(
         model_save_format="safetensors",
         model_cache_dir=cache_dir,
         model_repo_id=pretrained_model_name_or_path,
-        save_consolidated=True,
+        save_consolidated=False,
         is_peft=peft_config is not None,
     )
     checkpointer = Checkpointer(
