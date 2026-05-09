@@ -14,6 +14,17 @@
 
 from __future__ import annotations
 
+import warnings
+
+# Suppress pydantic v2 UnsupportedFieldAttributeWarning before heavy imports
+# (transformers, huggingface_hub) trigger schema generation.
+try:
+    from pydantic.warnings import UnsupportedFieldAttributeWarning
+
+    warnings.filterwarnings("ignore", category=UnsupportedFieldAttributeWarning)
+except ImportError:
+    pass
+
 import inspect
 import logging
 import math
@@ -90,6 +101,7 @@ from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     _supports_seq_lens,
+    filter_forward_kwargs,
     resolve_trust_remote_code,
 )
 from nemo_automodel.recipes._dist_setup import setup_distributed
@@ -119,11 +131,21 @@ def _get_model_name(cfg_model):
         return None
 
 
-def _uses_te_dot_product_attention(cfg_model):
+def _uses_te_dot_product_attention(model_or_cfg):
+    """Check whether the model uses TE DotProductAttention.
+
+    Accepts either an instantiated nn.Module (preferred — inspects actual modules)
+    or a config object (fallback — checks backend.attn string).
+    """
+    if isinstance(model_or_cfg, torch.nn.Module):
+        try:
+            from transformer_engine.pytorch.attention import DotProductAttention
+        except ImportError:
+            return False
+        return any(isinstance(m, DotProductAttention) for m in model_or_cfg.modules())
+    # Config fallback for call sites before model is built
     return (
-        True
-        if hasattr(cfg_model, "backend") and hasattr(cfg_model.backend, "attn") and cfg_model.backend.attn == "te"
-        else False
+        hasattr(model_or_cfg, "backend") and hasattr(model_or_cfg.backend, "attn") and model_or_cfg.backend.attn == "te"
     )
 
 
@@ -372,14 +394,20 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         save_consolidated=True,
         is_peft=is_peft,
     )
+    user_cfg = {}
     if cfg_ckpt is not None:
-        cfg_ckpt = cfg_ckpt.to_dict()
-        cfg_ckpt.pop("restore_from", None)
-        ckpt_kwargs |= cfg_ckpt
-    if ckpt_kwargs.get("is_peft", False) and ckpt_kwargs.get("model_save_format") == "torch_save":
-        raise ValueError(
-            "PEFT checkpointing is not supported for torch_save format. Save using `safetensors` format instead."
+        user_cfg = cfg_ckpt.to_dict()
+        user_cfg.pop("restore_from", None)
+    if is_peft and user_cfg.get("model_save_format") == "torch_save":
+        logger.warning(
+            "PEFT checkpointing is not supported for `torch_save` format; "
+            "discarding user checkpoint config and using safetensors defaults "
+            "(preserving `checkpoint_dir` if set)."
         )
+        if "checkpoint_dir" in user_cfg:
+            ckpt_kwargs["checkpoint_dir"] = user_cfg["checkpoint_dir"]
+    else:
+        ckpt_kwargs |= user_cfg
     checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
     return checkpoint_config
 
@@ -523,6 +551,8 @@ def build_dataloader(
 
             if packing_strategy == "neat":
                 from nemo_automodel.components.datasets.llm.neat_packing import neat_pack_dataset
+                from nemo_automodel.components.datasets.utils import neat_packed_collater
+                from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
 
                 ds = neat_pack_dataset(
                     ds,
@@ -530,8 +560,13 @@ def build_dataloader(
                     pack_size=packed_sequence_size,
                     max_packs=getattr(cfg_ps, "max_packs", None),
                     padding_idx=getattr(tokenizer, "pad_token_id", 0),
-                    drop_long_samples=getattr(cfg_ps, "drop_long_samples", False),
+                    drop_long_samples=getattr(cfg_ps, "drop_long_samples", True),
                 )
+                _attn_impl = get_attn_implementation(cfg_model)
+                configure_packing(attn_implementation=_attn_impl)
+                # Set collater with attn_implementation so it produces the right mask format
+                cfg_dl.collate_fn = lambda batch, _ai=_attn_impl: neat_packed_collater(batch, attn_implementation=_ai)
+                logger.info(f"Configured neat packing for attn_implementation={_attn_impl}")
             else:
                 # "thd" — existing packing logic
                 ds = pack_dataset(
@@ -563,17 +598,34 @@ def build_dataloader(
             if "shuffle" in cfg_dl:
                 del cfg_dl.shuffle
 
-            dist_sampler_kwargs = {
-                "num_replicas": dp_world_size,
-                "rank": dp_rank,
-                "shuffle": shuffle,
-            }
-            sampler = StatefulDistributedSampler(
-                ds,
-                seed=seed,
-                drop_last=True,
-                **dist_sampler_kwargs,
-            )
+            group_by_length = cfg_dl.get("group_by_length", False)
+            if "group_by_length" in cfg_dl:
+                del cfg_dl.group_by_length
+
+            if group_by_length:
+                from nemo_automodel.components.datasets.llm.length_grouped_sampler import (
+                    LengthGroupedSampler as LLMLengthGroupedSampler,
+                )
+
+                sampler = LLMLengthGroupedSampler(
+                    dataset=ds,
+                    batch_size=local_batch_size,
+                    seed=seed,
+                    num_replicas=dp_world_size,
+                    rank=dp_rank,
+                )
+            else:
+                dist_sampler_kwargs = {
+                    "num_replicas": dp_world_size,
+                    "rank": dp_rank,
+                    "shuffle": shuffle,
+                }
+                sampler = StatefulDistributedSampler(
+                    ds,
+                    seed=seed,
+                    drop_last=True,
+                    **dist_sampler_kwargs,
+                )
             dl_kwargs = {"sampler": sampler, "batch_size": local_batch_size}
             if pp_enabled:
                 dl_kwargs["drop_last"] = True
@@ -848,7 +900,7 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: 
             val_check_interval=cfg.get("step_scheduler.val_every_steps", None),
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
-            pp_enabled=False,
+            pp_enabled=pp_enabled,
             cp_size=cfg.get("distributed.cp_size", 1),
             model=model,
         )[0]
@@ -1114,6 +1166,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         self.mfu_calculator = AutoMFU.from_config(self.model_parts[0])
 
+        # NEFTune: noisy embeddings for improved instruction fine-tuning
+        neftune_cfg = self.cfg.get("neftune", None)
+        self.neftune = None
+        if neftune_cfg is not None:
+            from nemo_automodel.components.training.neftune import NEFTune
+
+            noise_alpha = neftune_cfg.get("noise_alpha", 5.0) if hasattr(neftune_cfg, "get") else neftune_cfg
+            self.neftune = NEFTune(noise_alpha=float(noise_alpha))
+            self.neftune.activate(self.model_parts[0])
+
         restore_from = self.cfg.get("checkpoint.restore_from", None)
         # Initialize JSONL loggers
         self.metric_logger_train = build_metric_logger(
@@ -1236,40 +1298,46 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             mp.train()
         self.timestamp = time.perf_counter()
 
-        for epoch in self.step_scheduler.epochs:
-            self.step_scheduler.set_epoch(epoch)
-            # The step scheduler yields a list of batches with the following properties:
-            # 1. len(batches) == grad_acc_steps
-            # 2. len(batches[0]) == batch_size
-            for batches in self.step_scheduler:
-                # If QAT delayed fake-quant is configured, enable after threshold
-                self._enable_qat_if_delayed(self.step_scheduler.step)
-                train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
-                # Collect MoE load balance metrics (all ranks participate in all-reduce)
-                self._collect_moe_load_balance()
-                # log
-                self.log_train_metrics(train_log_data)
+        pbar = self._make_progress_bar()
+        try:
+            for epoch in self.step_scheduler.epochs:
+                self.step_scheduler.set_epoch(epoch)
+                # The step scheduler yields a list of batches with the following properties:
+                # 1. len(batches) == grad_acc_steps
+                # 2. len(batches[0]) == batch_size
+                for batches in self.step_scheduler:
+                    # If QAT delayed fake-quant is configured, enable after threshold
+                    self._enable_qat_if_delayed(self.step_scheduler.step)
+                    train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                    # Collect MoE load balance metrics (all ranks participate in all-reduce)
+                    self._collect_moe_load_balance()
+                    # log
+                    self.log_train_metrics(train_log_data)
+                    self._update_progress_bar(pbar, train_log_data.metrics)
 
-                # Run validation every val_every_steps
-                val_losses = {}
-                if self.step_scheduler.is_val_step:
-                    for val_name, val_dataloader in self.val_dataloaders.items():
-                        val_log_data = self._run_validation_epoch(val_dataloader)
-                        val_losses[val_name] = val_log_data.metrics["val_loss"]
-                        self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
-                    for mp in self.model_parts:
-                        mp.train()
+                    # Run validation every val_every_steps
+                    val_losses = {}
+                    if self.step_scheduler.is_val_step:
+                        for val_name, val_dataloader in self.val_dataloaders.items():
+                            val_log_data = self._run_validation_epoch(val_dataloader)
+                            val_losses[val_name] = val_log_data.metrics["val_loss"]
+                            self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
+                        for mp in self.model_parts:
+                            mp.train()
 
-                # Save the checkpoint every ckpt_every_steps
-                if self.step_scheduler.is_ckpt_step:
-                    self.save_checkpoint(
-                        epoch,
-                        self.step_scheduler.step,
-                        train_log_data.metrics["loss"],
-                        val_losses,
-                        best_metric_key=self.best_metric_key,
-                    )
-                self._maybe_collect_garbage()
+                    # Save the checkpoint every ckpt_every_steps
+                    if self.step_scheduler.is_ckpt_step:
+                        self.save_checkpoint(
+                            epoch,
+                            self.step_scheduler.step,
+                            train_log_data.metrics["loss"],
+                            val_losses,
+                            best_metric_key=self.best_metric_key,
+                        )
+                    self._maybe_collect_garbage()
+        finally:
+            if pbar is not None:
+                pbar.close()
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
         for v in self.metric_logger_valid.values():
@@ -1300,7 +1368,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         train_ctx, batch = make_cp_batch_and_ctx(
             self.device_mesh,
             batch,
-            use_te=_uses_te_dot_product_attention(self.cfg.model) and _uses_thd_collater(self.cfg.dataloader),
+            use_te=_uses_te_dot_product_attention(
+                self.model_parts[0] if hasattr(self, "model_parts") else self.cfg.model
+            )
+            and _uses_thd_collater(self.cfg.dataloader),
             padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
             num_chunks=_get_num_thd_chunks(self.pp_enabled, self.cfg),
         )
@@ -1317,6 +1388,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     targets = None
 
                 input_ids = batch.pop("input_ids")
+
+                # Update PP stage shapes for the current batch's seq_len.
+                # This is a no-op when the length hasn't changed.
+                self.pp.update_seq_len(input_ids.shape[1])
 
                 # Filter out None values and empty dicts from batch to avoid PP chunking errors
                 batch_filtered = {
@@ -1354,6 +1429,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 else nullcontext()
             )
             with train_ctx(), sync_ctx, fp8_ctx:
+                batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
                     out = model(logits_to_keep=1, **batch)
@@ -1567,18 +1643,24 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 total_num_label_tokens += num_label_tokens
 
         total_loss = self._dp_allreduce(total_loss, include_cp=True)
-        total_num_label_tokens = self._dp_allreduce(torch.tensor(total_num_label_tokens, dtype=torch.long)).item()
+        total_num_label_tokens = self._dp_allreduce(
+            torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device)
+        ).item()
         val_loss = total_loss / max(total_num_label_tokens, 1e-8)
 
-        # For PP, send val_loss from last stage to main rank for logging
+        # For PP, send val_loss and num_label_tokens from last stage to main rank
         if self.pp_enabled:
             val_loss = val_loss.to(self.dist_env.device)
-            # Send loss to first rank from the last stage
+            # On non-last ranks total_num_label_tokens is 0; this tensor is just a recv buffer.
+            pp_num_tokens = torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device)
             src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
             if self.dist_env.rank == src_rank:
                 torch.distributed.send(val_loss, dst=0)
+                torch.distributed.send(pp_num_tokens, dst=0)
             elif self.dist_env.is_main:
                 torch.distributed.recv(val_loss, src=src_rank)
+                torch.distributed.recv(pp_num_tokens, src=src_rank)
+                total_num_label_tokens = pp_num_tokens.item()
 
         val_loss = val_loss.item() if isinstance(val_loss, torch.Tensor) else val_loss
 

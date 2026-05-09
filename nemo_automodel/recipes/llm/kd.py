@@ -68,6 +68,7 @@ from nemo_automodel.components.training.utils import (
     prepare_for_grad_accumulation,
     scale_grads_and_clip_grad_norm,
 )
+from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     _get_num_thd_chunks,
@@ -407,15 +408,17 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 ScopedModuleOffloading(self.teacher_model, enabled=self._offload_teacher_model),
                 torch.no_grad(),
             ):
-                teacher_logits = self.teacher_model(**batch)
+                teacher_batch = filter_forward_kwargs(self.teacher_model, batch)
+                teacher_logits = self.teacher_model(**teacher_batch)
                 teacher_logits = getattr(teacher_logits, "logits", teacher_logits).detach().clone()
 
             # Student forward.
+            student_batch = filter_forward_kwargs(model, batch)
             student_keep_last = isinstance(self.loss_fn, FusedLinearCrossEntropy)
             if student_keep_last:
-                student_out = model(logits_to_keep=1, **batch)
+                student_out = model(logits_to_keep=1, **student_batch)
             else:
-                student_out = model(**batch)
+                student_out = model(**student_batch)
 
             student_logits = getattr(student_out, "logits", student_out)  # shape (B, S, V)
 
@@ -768,24 +771,30 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         for mp in self.model_parts:
             mp.train()
         self.timestamp = time.perf_counter()
-        for epoch in self.step_scheduler.epochs:
-            self.step_scheduler.set_epoch(epoch)
-            for batches in self.step_scheduler:
-                self._enable_qat_if_delayed(self.step_scheduler.step)
-                train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
-                self._collect_moe_load_balance()
-                self.log_train_metrics(train_log_data)
-                val_losses = {}
-                if self.step_scheduler.is_val_step:
-                    logger.warning("Validation is not supported for pipeline parallelism; skipping")
-                if self.step_scheduler.is_ckpt_step:
-                    self.save_checkpoint(
-                        epoch,
-                        self.step_scheduler.step,
-                        train_log_data.metrics["loss"],
-                        val_losses,
-                        best_metric_key=self.best_metric_key,
-                    )
+        pbar = self._make_progress_bar()
+        try:
+            for epoch in self.step_scheduler.epochs:
+                self.step_scheduler.set_epoch(epoch)
+                for batches in self.step_scheduler:
+                    self._enable_qat_if_delayed(self.step_scheduler.step)
+                    train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                    self._collect_moe_load_balance()
+                    self.log_train_metrics(train_log_data)
+                    self._update_progress_bar(pbar, train_log_data.metrics)
+                    val_losses = {}
+                    if self.step_scheduler.is_val_step:
+                        logger.warning("Validation is not supported for pipeline parallelism; skipping")
+                    if self.step_scheduler.is_ckpt_step:
+                        self.save_checkpoint(
+                            epoch,
+                            self.step_scheduler.step,
+                            train_log_data.metrics["loss"],
+                            val_losses,
+                            best_metric_key=self.best_metric_key,
+                        )
+        finally:
+            if pbar is not None:
+                pbar.close()
         self.metric_logger_train.close()
         for v in self.metric_logger_valid.values():
             v.close()
