@@ -50,5 +50,25 @@ if [ "${GPU_CC}" -lt "90" ]; then
     [ -n "$_nvshmem" ] && mv "${_nvshmem}._hidden" "$_nvshmem"
 else
     echo "GPU is Hopper+ (sm_${GPU_CC}): building deep_ep with SM90 features enabled"
+
+    # Install everything except moe first so that nvidia-nvtx wheels are
+    # already in the venv before we attempt to build deep-ep from source.
+    uv sync --extra all --extra fa --extra cuda_source
+
+    # deep-ep's hybrid_ep extension links against -lnvtx3interop at build time.
+    # The nvidia-nvtx Python package ships only libnvtx3interop.so.1 (no
+    # unversioned symlink), and its lib dir is not on the system linker path.
+    # Fix both issues before the moe sync triggers the deep-ep build.
+    _nvtx_lib=$("$VENV_DIR/bin/python" -c \
+        "import os, nvidia.nvtx; print(os.path.join(nvidia.nvtx.__path__[0], 'lib'))" 2>/dev/null || true)
+    if [ -n "$_nvtx_lib" ] && [ -f "${_nvtx_lib}/libnvtx3interop.so.1" ]; then
+        [ -e "${_nvtx_lib}/libnvtx3interop.so" ] || \
+            ln -s "${_nvtx_lib}/libnvtx3interop.so.1" "${_nvtx_lib}/libnvtx3interop.so"
+        export LIBRARY_PATH="${_nvtx_lib}${LIBRARY_PATH:+:$LIBRARY_PATH}"
+        echo "Registered nvtx lib dir for linker: ${_nvtx_lib}"
+    else
+        echo "Warning: libnvtx3interop.so.1 not found; deep-ep build may fail"
+    fi
+
     uv sync --extra all --extra fa --extra moe --extra cuda_source
 fi
