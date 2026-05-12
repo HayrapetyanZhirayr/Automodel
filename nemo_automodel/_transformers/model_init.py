@@ -40,9 +40,10 @@ from transformers.modeling_utils import PreTrainedModel
 if not hasattr(PretrainedConfig, "pad_token_id"):
     PretrainedConfig.pad_token_id = None
 
-from nemo_automodel._transformers.utils import apply_qwen3_omni_config_patch
+from nemo_automodel._transformers.utils import apply_qwen3_5_cond_gen_forward_patch, apply_qwen3_omni_config_patch
 
 apply_qwen3_omni_config_patch()
+apply_qwen3_5_cond_gen_forward_patch()
 
 import nemo_automodel.components.checkpoint.utils as checkpoint_utils
 import nemo_automodel.components.distributed.utils as dist_utils

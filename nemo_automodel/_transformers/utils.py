@@ -88,6 +88,74 @@ def apply_qwen3_omni_config_patch():
         Qwen3OmniMoeTalkerCodePredictorConfig.use_sliding_window = False
 
 
+def apply_qwen3_5_cond_gen_forward_patch() -> None:
+    """Apply Qwen3.5 conditional-generation forward monkey-patch at runtime."""
+    try:
+        from transformers.cache_utils import Cache
+        from transformers.models.qwen3_5.modeling_qwen3_5 import (
+            Qwen3_5CausalLMOutputWithPast,
+            Qwen3_5ForConditionalGeneration,
+        )
+        from transformers.processing_utils import Unpack
+        from transformers.utils import TransformersKwargs
+
+        if getattr(Qwen3_5ForConditionalGeneration.forward, "__nemo_qwen3_5_cond_gen_forward_patched__", False):
+            logger.info("Qwen3_5ForConditionalGeneration.forward patch already applied.")
+            return
+
+        def _cond_gen_forward_with_hidden_states(
+            self,
+            input_ids: torch.LongTensor = None,
+            attention_mask: torch.Tensor | None = None,
+            position_ids: torch.LongTensor | None = None,
+            past_key_values: Cache | None = None,
+            inputs_embeds: torch.FloatTensor | None = None,
+            labels: torch.LongTensor | None = None,
+            pixel_values: torch.Tensor | None = None,
+            pixel_values_videos: torch.FloatTensor | None = None,
+            image_grid_thw: torch.LongTensor | None = None,
+            video_grid_thw: torch.LongTensor | None = None,
+            mm_token_type_ids: torch.IntTensor | None = None,
+            logits_to_keep: int | torch.Tensor = 0,
+            **kwargs: Unpack[TransformersKwargs],
+        ) -> Qwen3_5CausalLMOutputWithPast:
+            outputs = self.model(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                mm_token_type_ids=mm_token_type_ids,
+                **kwargs,
+            )
+            hidden_states = outputs[0]
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+            loss = None
+            if labels is not None:
+                loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
+
+            return Qwen3_5CausalLMOutputWithPast(
+                loss=loss,
+                logits=logits,
+                past_key_values=outputs.past_key_values,
+                hidden_states=hidden_states,
+                attentions=outputs.attentions,
+                rope_deltas=outputs.rope_deltas,
+            )
+
+        _cond_gen_forward_with_hidden_states.__nemo_qwen3_5_cond_gen_forward_patched__ = True  # type: ignore[attr-defined]
+        Qwen3_5ForConditionalGeneration.forward = _cond_gen_forward_with_hidden_states  # type: ignore[method-assign]
+        print("Applied Qwen3_5ForConditionalGeneration.forward patch to return hidden_states (for CCE)", flush=True)
+    except Exception:
+        logger.debug("Failed to apply Qwen3.5 conditional-generation forward patch.", exc_info=True)
+
+
 def _patch_bytes_to_unicode():
     """Re-export bytes_to_unicode on transformers.models.gpt2.tokenization_gpt2.
 
