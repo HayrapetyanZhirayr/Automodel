@@ -58,7 +58,9 @@ from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
+from nemo_automodel.components.loss.kd_loss import FusedLinearKDLoss
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.utils import (
     ScopedModuleOffloading,
@@ -92,6 +94,26 @@ def _format_duration(seconds: float) -> str:
         return f"{int(seconds // 3600)}h {int((seconds % 3600) // 60)}m"
     return f"{int(seconds // 86400)}d {int((seconds % 86400) // 3600)}h"
 
+
+
+def _get_lm_head_weight(model: torch.nn.Module) -> torch.Tensor:
+    """Extract and materialize the language model head weight from *model*."""
+    lm_head = None
+    if hasattr(model, "get_output_embeddings"):
+        emb = model.get_output_embeddings()
+        if emb is not None:
+            lm_head = emb.weight
+    if lm_head is None:
+        for n, p in model.named_parameters(remove_duplicate=False):
+            if "lm_head" in n and n.endswith(".weight"):
+                lm_head = p
+                break
+    if lm_head is None:
+        raise ValueError("lm_head.weight not found in model")
+    # Materialise if vocab-sharded (DTensor / TP).
+    if hasattr(lm_head, "full_tensor"):
+        lm_head = lm_head.full_tensor()
+    return lm_head
 
 
 def _build_kd_loss_fn(cfg_kd):
@@ -402,6 +424,15 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             if is_train
             else nullcontext()
         )
+        kd_is_fused = isinstance(self.kd_loss_fn, FusedLinearKDLoss)
+        ce_is_fused = isinstance(self.loss_fn, FusedLinearCrossEntropy)
+
+        if not kd_is_fused and ce_is_fused:
+            raise ValueError(
+                "Cannot use non-fused KD together with fused CE: "
+                "non-fused KD needs full logits, but fused CE avoids materializing logits."
+            )
+
         with train_ctx(), sync_ctx:
             # No grad for teacher forward.
             with (
@@ -409,42 +440,78 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 torch.no_grad(),
             ):
                 teacher_batch = filter_forward_kwargs(self.teacher_model, batch)
-                teacher_logits = self.teacher_model(**teacher_batch)
-                teacher_logits = getattr(teacher_logits, "logits", teacher_logits).detach().clone()
+                if kd_is_fused:
+                    teacher_out = self.teacher_model(logits_to_keep=1, output_hidden_states=True, **teacher_batch)
+                    teacher_hidden_states = get_final_hidden_states(teacher_out)
+                    if teacher_hidden_states is None:
+                        raise ValueError(
+                            "FusedLinearKDLoss requires teacher hidden states. "
+                            "Ensure the teacher model config has output_hidden_states=True."
+                        )
+                    teacher_logits = None
+                    teacher_lm_weight = _get_lm_head_weight(self.teacher_model)
+                else:
+                    teacher_out = self.teacher_model(**teacher_batch)
+                    teacher_logits = getattr(teacher_out, "logits", teacher_out).detach()
+                    teacher_hidden_states = None  # not needed so setting to None
 
             # Student forward.
             student_batch = filter_forward_kwargs(model, batch)
-            student_keep_last = isinstance(self.loss_fn, FusedLinearCrossEntropy)
-            if student_keep_last:
-                student_out = model(logits_to_keep=1, **student_batch)
+            if ce_is_fused or kd_is_fused:
+                student_out = model(logits_to_keep=1, output_hidden_states=True, **student_batch)
+                student_hidden_states = get_final_hidden_states(student_out)
+                student_logits = None
             else:
                 student_out = model(**student_batch)
-
-            student_logits = getattr(student_out, "logits", student_out)  # shape (B, S, V)
+                student_hidden_states = None
+                student_logits = getattr(student_out, "logits", student_out)  # shape (B, S, V)
 
             # Cross-entropy loss against true labels (skip when kd_ratio >= 1.0).
             if self.kd_ratio >= 1.0:
-                ce_loss = student_logits.new_tensor(0.0, dtype=student_logits.dtype)
+                is_self_distilation = (self.cfg.teacher_model.pretrained_model_name_or_path == self.cfg.model.pretrained_model_name_or_path)
+                if is_self_distilation:
+                   raise ValueError(
+                    "Self-distillation with kd_ratio >= 1.0 results in zero training signal "
+                    "because teacher and student are initially identical and only KL loss is used."
+                    )
+                ce_loss = None
             else:
                 ce_loss = calculate_loss(
                     self.loss_fn,
                     logits=student_logits,
                     labels=labels,
                     model=model,
-                    hidden_states=student_out.hidden_states[-1] if "hidden_states" in student_out else None,
+                    hidden_states=student_hidden_states,
                     num_label_tokens=num_label_tokens,
                 )
 
             # Reminder: kd_loss is normalized by num_label_tokens, which is typically
             # larger than the number of labels in this batch alone because it covers all
             # batches in one optimizer step (grad_acc_steps = gbs / mbs).
-            kd_loss = self.kd_loss_fn(
-                student_logits,
-                teacher_logits,
-                labels,
-                num_batch_labels=num_label_tokens,
-            )
-            local_loss = (1.0 - self.kd_ratio) * ce_loss + self.kd_ratio * kd_loss
+            if kd_is_fused:
+                student_hidden_states = get_final_hidden_states(student_out)
+                if student_hidden_states is None:
+                    raise ValueError(
+                        "FusedLinearKDLoss requires student hidden states. "
+                        "Ensure the model config has output_hidden_states=True."
+                    )
+                student_lm_weight = _get_lm_head_weight(model)
+                kd_loss = self.kd_loss_fn(
+                    student_hidden_states,
+                    teacher_hidden_states,
+                    labels,
+                    student_lm_weight=student_lm_weight,
+                    teacher_lm_weight=teacher_lm_weight,
+                    num_batch_labels=num_label_tokens,
+                )
+            else:
+                kd_loss = self.kd_loss_fn(
+                    student_logits,
+                    teacher_logits,
+                    labels,
+                    num_batch_labels=num_label_tokens,
+                )
+            local_loss = (1.0 - self.kd_ratio) * ce_loss + self.kd_ratio * kd_loss    
             if is_train:
                 (local_loss * self._get_dp_group_size(include_cp=True)).backward()
             detached_local = local_loss.detach().clone()

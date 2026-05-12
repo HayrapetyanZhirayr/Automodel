@@ -210,3 +210,120 @@ class KDLoss(nn.Module):
             return -torch.sum(kl_per_token) / num_batch_labels
         else:
             return -torch.mean(kl_per_token)
+
+
+class FusedLinearKDLoss(nn.Module):
+    """Forward KL divergence KD loss computed chunk-by-chunk from hidden states.
+
+    Avoids materializing the full ``[*, vocab_size]`` logit tensor by processing
+    tokens in chunks.  For each chunk:
+
+        student_logits = student_hs @ lm_weight.T
+        teacher_logits = teacher_hs @ lm_weight.T
+        KL(teacher ‖ student) += sum(P_teacher * (log P_teacher - log P_student))
+
+    Peak memory is ``O(chunk_size × vocab_size)`` rather than
+    ``O(seq_len × vocab_size)``.  Semantics are identical to :class:`KDLoss`.
+
+    Args:
+        ignore_index: Label value marking padding tokens (default ``-100``).
+        temperature: Softmax temperature *T*.  Loss is multiplied by *T²* so
+            gradient magnitudes are independent of temperature (Hinton et al. 2015).
+        fp32_upcast: Cast to float32 before computing softmax / log-softmax
+            (default ``True``).
+        chunk_size: Number of tokens per chunk.  ``None`` → auto
+            (⌊8 M / vocab_size⌋ tokens, matching the dense-chunked KDLoss heuristic).
+    """
+
+    def __init__(
+        self,
+        ignore_index: int = -100,
+        temperature: float = 1.0,
+        fp32_upcast: bool = True,
+        chunk_size: Optional[int] = None,
+    ):
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.temperature = temperature
+        self.fp32_upcast = fp32_upcast
+        self.chunk_size = chunk_size
+
+    def forward(
+        self,
+        student_hidden_states: torch.Tensor,
+        teacher_hidden_states: torch.Tensor,
+        labels: torch.Tensor,
+        student_lm_weight: torch.Tensor,
+        teacher_lm_weight: torch.Tensor,
+        num_batch_labels: int | None = None,
+    ) -> torch.Tensor:
+        """Compute the chunked KD loss from hidden states.
+
+        Args:
+            student_hidden_states: Shape ``[*, hidden_size]``.
+            teacher_hidden_states: Shape ``[*, hidden_size]``, no gradient required.
+            labels: Shape ``[*]``.  Positions equal to ``ignore_index`` are excluded.
+            student_lm_weight: Student LM head weight, shape ``[vocab_size, hidden_size]``.
+            teacher_lm_weight: Teacher LM head weight, shape ``[vocab_size, hidden_size]``.
+            num_batch_labels: Total valid tokens across gradient-accumulation steps.
+                When provided: loss = ``sum(kl) / num_batch_labels``.
+                When ``None``: loss = ``mean(kl)`` over valid tokens in this micro-batch.
+
+        Returns:
+            Scalar KD loss.
+        """
+        hidden_size = student_hidden_states.shape[-1]
+        s_hs = student_hidden_states.view(-1, hidden_size)
+        t_hs = teacher_hidden_states.view(-1, hidden_size)
+        labels_flat = labels.view(-1)
+
+        valid_mask = labels_flat != self.ignore_index
+        n_valid = int(valid_mask.sum())
+        if n_valid == 0:
+            return s_hs.new_tensor(0.0)
+
+        s_hs = s_hs[valid_mask]
+        t_hs = t_hs[valid_mask]
+
+        vocab_size = student_lm_weight.shape[0]
+        chunk_size = self.chunk_size or max(1, min(n_valid, 8 * 1024 * 1024 // max(vocab_size, 1)))
+
+        # Accumulate sum(P_teacher * log P_student) as a scalar — avoids
+        # keeping per-token tensors alive across the whole sequence.
+        kl_sum = s_hs.new_tensor(0.0)
+
+        for start in range(0, n_valid, chunk_size):
+            end = min(start + chunk_size, n_valid)
+            s_chunk = s_hs[start:end]
+            t_chunk = t_hs[start:end]
+
+            # [chunk, vocab_size] — logits materialised only for this chunk.
+            s_logits = F.linear(s_chunk, student_lm_weight)
+            with torch.no_grad():
+                t_logits = F.linear(t_chunk, teacher_lm_weight)
+
+            if self.fp32_upcast:
+                s_logits = s_logits.float()
+                t_logits = t_logits.float()
+
+            if self.temperature != 1.0:
+                inv_t = 1.0 / self.temperature
+                s_logits = s_logits * inv_t
+                t_logits = t_logits * inv_t
+
+            teacher_prob = F.softmax(t_logits, dim=-1)
+            student_log_prob = F.log_softmax(s_logits, dim=-1)
+
+            # sum(P * log Q) summed over chunk tokens → scalar contribution.
+            kl_sum = kl_sum + teacher_prob.mul(student_log_prob).sum()
+
+            del s_logits, t_logits, teacher_prob, student_log_prob
+
+        # T² scaling (Hinton et al., 2015).
+        if self.temperature != 1.0:
+            kl_sum = kl_sum * (self.temperature**2)
+
+        # kl_sum = sum(P * log Q) ≤ 0.  Negate to get a positive minimisation target.
+        if num_batch_labels is not None:
+            return -kl_sum / num_batch_labels
+        return -kl_sum / n_valid
