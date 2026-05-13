@@ -293,7 +293,10 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         """Build student & teacher, dataloaders, optimizers, etc."""
         # Right now, we only support tokenizer compatibility for the same tokenizer.
         # We will add support for different tokenizers in the future.
-        _verify_tokenizer_compatibility(self.cfg.get("model", None), self.cfg.get("teacher_model", None))
+        self.kd_ratio: float = float(self.cfg.get("kd_ratio", 0.5))
+        self.is_kd_train = (self.kd_ratio != 0.0)
+        if self.is_kd_train:
+            _verify_tokenizer_compatibility(self.cfg.get("model", None), self.cfg.get("teacher_model", None))
 
         # Let the parent class build *everything* for the student first.
         super().setup()
@@ -326,22 +329,25 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                     "logits are captured, producing incorrect KD targets for earlier microbatches."
                 )
         else:
-            self.teacher_model = _build_teacher_model(
-                cfg_teacher=self.cfg.get("teacher_model", None),
-                seed=self.cfg.get("seed", 42),
-                has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
-                device_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
-                distributed_config=self.distributed_config,
-                device=teacher_device,
-            )
+            if self.is_kd_train:
+                self.teacher_model = _build_teacher_model(
+                    cfg_teacher=self.cfg.get("teacher_model", None),
+                    seed=self.cfg.get("seed", 42),
+                    has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
+                    device_mesh=self.device_mesh,
+                    moe_mesh=self.moe_mesh,
+                    distributed_config=self.distributed_config,
+                    device=teacher_device,
+                )
+            else:
+                self.teacher_model = None
             self.teacher_pp = None
         import gc; gc.collect(); torch.cuda.empty_cache()
         logger.info("Teacher Model: " + str(self.teacher_model))
 
         # KD
         self.kd_loss_fn = _build_kd_loss_fn(self.cfg.get("kd_loss_fn", None))
-        self.kd_ratio: float = float(self.cfg.get("kd_ratio", 0.5))
+        # self.kd_ratio: float = float(self.cfg.get("kd_ratio", 0.5))
         logger.info("KD Loss config: " + str(self.cfg.get("kd_loss_fn", None)))
         temperature = getattr(self.kd_loss_fn, "temperature", "N/A")
         logger.info(f"Knowledge-distillation enabled: ratio={self.kd_ratio}, T={temperature}")
@@ -427,33 +433,37 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         kd_is_fused = isinstance(self.kd_loss_fn, FusedLinearKDLoss)
         ce_is_fused = isinstance(self.loss_fn, FusedLinearCrossEntropy)
 
-        if not kd_is_fused and ce_is_fused:
+        if self.is_kd_train and not kd_is_fused and ce_is_fused:
             raise ValueError(
                 "Cannot use non-fused KD together with fused CE: "
                 "non-fused KD needs full logits, but fused CE avoids materializing logits."
             )
 
         with train_ctx(), sync_ctx:
-            # No grad for teacher forward.
-            with (
-                ScopedModuleOffloading(self.teacher_model, enabled=self._offload_teacher_model),
-                torch.no_grad(),
-            ):
-                teacher_batch = filter_forward_kwargs(self.teacher_model, batch)
-                if kd_is_fused:
-                    teacher_out = self.teacher_model(logits_to_keep=1, output_hidden_states=True, **teacher_batch)
-                    teacher_hidden_states = get_final_hidden_states(teacher_out)
-                    if teacher_hidden_states is None:
-                        raise ValueError(
-                            "FusedLinearKDLoss requires teacher hidden states. "
-                            "Ensure the teacher model config has output_hidden_states=True."
-                        )
-                    teacher_logits = None
-                    teacher_lm_weight = _get_lm_head_weight(self.teacher_model)
-                else:
-                    teacher_out = self.teacher_model(**teacher_batch)
-                    teacher_logits = getattr(teacher_out, "logits", teacher_out).detach()
-                    teacher_hidden_states = None  # not needed so setting to None
+            if self.is_kd_train:
+                # No grad for teacher forward.
+                with (
+                    ScopedModuleOffloading(self.teacher_model, enabled=self._offload_teacher_model),
+                    torch.no_grad(),
+                ):
+                    teacher_batch = filter_forward_kwargs(self.teacher_model, batch)
+                    if kd_is_fused:
+                        teacher_out = self.teacher_model(logits_to_keep=1, output_hidden_states=True, **teacher_batch)
+                        teacher_hidden_states = get_final_hidden_states(teacher_out)
+                        if teacher_hidden_states is None:
+                            raise ValueError(
+                                "FusedLinearKDLoss requires teacher hidden states. "
+                                "Ensure the teacher model config has output_hidden_states=True."
+                            )
+                        teacher_logits = None
+                        teacher_lm_weight = _get_lm_head_weight(self.teacher_model)
+                    else:
+                        teacher_out = self.teacher_model(**teacher_batch)
+                        teacher_logits = getattr(teacher_out, "logits", teacher_out).detach()
+                        teacher_hidden_states = None  # not needed so setting to None
+            else:
+                teacher_batch = teacher_out = teacher_logits = teacher_hidden_states = None
+
 
             # Student forward.
             student_batch = filter_forward_kwargs(model, batch)
@@ -488,29 +498,32 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             # Reminder: kd_loss is normalized by num_label_tokens, which is typically
             # larger than the number of labels in this batch alone because it covers all
             # batches in one optimizer step (grad_acc_steps = gbs / mbs).
-            if kd_is_fused:
-                student_hidden_states = get_final_hidden_states(student_out)
-                if student_hidden_states is None:
-                    raise ValueError(
-                        "FusedLinearKDLoss requires student hidden states. "
-                        "Ensure the model config has output_hidden_states=True."
+            if self.kd_ratio != 0.0:
+                if kd_is_fused:
+                    student_hidden_states = get_final_hidden_states(student_out)
+                    if student_hidden_states is None:
+                        raise ValueError(
+                            "FusedLinearKDLoss requires student hidden states. "
+                            "Ensure the model config has output_hidden_states=True."
+                        )
+                    student_lm_weight = _get_lm_head_weight(model)
+                    kd_loss = self.kd_loss_fn(
+                        student_hidden_states,
+                        teacher_hidden_states,
+                        labels,
+                        student_lm_weight=student_lm_weight,
+                        teacher_lm_weight=teacher_lm_weight,
+                        num_batch_labels=num_label_tokens,
                     )
-                student_lm_weight = _get_lm_head_weight(model)
-                kd_loss = self.kd_loss_fn(
-                    student_hidden_states,
-                    teacher_hidden_states,
-                    labels,
-                    student_lm_weight=student_lm_weight,
-                    teacher_lm_weight=teacher_lm_weight,
-                    num_batch_labels=num_label_tokens,
-                )
+                else:
+                    kd_loss = self.kd_loss_fn(
+                        student_logits,
+                        teacher_logits,
+                        labels,
+                        num_batch_labels=num_label_tokens,
+                    )
             else:
-                kd_loss = self.kd_loss_fn(
-                    student_logits,
-                    teacher_logits,
-                    labels,
-                    num_batch_labels=num_label_tokens,
-                )
+                kd_loss = torch.tensor(0.0)
             local_loss = (1.0 - self.kd_ratio) * ce_loss + self.kd_ratio * kd_loss    
             if is_train:
                 (local_loss * self._get_dp_group_size(include_cp=True)).backward()
