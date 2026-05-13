@@ -96,6 +96,12 @@ class FSDP2Config:
             memory at a small throughput cost.  Default ``2``.
         fsdp2_forward_prefetch_depth (int): Number of FSDP units to prefetch during
             forward pass.  Default ``1``.
+        fp32_param_patterns (Optional[List[str]]): List of substring patterns. Any parameter
+            whose fully-qualified name contains one of these strings will be cast to float32
+            before FSDP sharding, so the optimizer updates it in full precision. Useful for
+            norm scales and biases that are stored in bfloat16 but have magnitudes too large
+            to accumulate small learning-rate updates in bfloat16.
+            Example: ``["layernorm", "norm.weight", "dt_bias"]``.
     """
 
     sequence_parallel: bool = False
@@ -112,6 +118,7 @@ class FSDP2Config:
     enable_fsdp2_prefetch: bool = False
     fsdp2_backward_prefetch_depth: int = 2
     fsdp2_forward_prefetch_depth: int = 1
+    fp32_param_patterns: Optional[List[str]] = None
 
     def __post_init__(self):
         if self.mp_policy is None:

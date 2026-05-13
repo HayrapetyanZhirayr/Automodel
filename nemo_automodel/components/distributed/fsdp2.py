@@ -112,6 +112,21 @@ class FSDP2Manager:
         Returns:
             The parallelized model.
         """
+        fp32_patterns = getattr(self.config, "fp32_param_patterns", None) or []
+        if fp32_patterns:
+            import torch
+            cast_count = 0
+            for name, param in model.named_parameters():
+                if param.dtype == torch.bfloat16 and any(pat in name for pat in fp32_patterns):
+                    param.data = param.data.float()
+                    cast_count += 1
+            if cast_count:
+                logger.info(
+                    "Cast %d parameter(s) to float32 based on fp32_param_patterns=%s",
+                    cast_count,
+                    fp32_patterns,
+                )
+
         if get_world_size_safe() == 1:
             logger.info("World size is 1, skipping parallelization.")
             if self.activation_checkpointing:
