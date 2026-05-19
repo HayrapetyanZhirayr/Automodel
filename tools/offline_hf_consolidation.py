@@ -145,6 +145,8 @@ def spread_fqns_to_hf_file_indices(
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse command-line options for offline HF checkpoint consolidation."""
+
     parser = argparse.ArgumentParser(
         description=(
             "Consolidate sharded HF safetensors checkpoints into consolidated files, "
@@ -189,6 +191,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Run offline HF safetensors consolidation."""
+
     args = parse_args()
 
     backend = args.backend

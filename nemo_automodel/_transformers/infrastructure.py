@@ -565,11 +565,20 @@ def apply_model_infrastructure(
     if autopipeline is None:
         print_trainable_parameters(model)  # Once model's been sharded
         # Ensure model is on the correct device.
-        # Skip when checkpoint was loaded post-shard (params are already on the
-        # target device) to avoid triggering FSDP's reset_sharded_param which
-        # fails on tied parameters (e.g. lm_head/embed_tokens with TP>1).
+        # Skip only when params are actually sharded (any DTensor in the model)
+        # AND the checkpoint was loaded post-shard. Calling model.to(device) on
+        # sharded params triggers FSDP's reset_sharded_param, which fails on
+        # tied parameters (e.g. lm_head/embed_tokens with TP>1).
         # See: https://github.com/pytorch/pytorch/issues/151085
-        if not should_load_checkpoint:
+        # In unsharded cases (single-GPU, DDP, or any combination of TP/DP/CP/EP
+        # that left params as plain tensors), model.to(device) must still run so
+        # that persistent buffers not present in the checkpoint (e.g. Gemma4's
+        # Gemma4ClippableLinear input_min/max, Gemma4TextDecoderLayer
+        # layer_scalar) reach the GPU.
+        from torch.distributed.tensor import DTensor
+
+        has_sharded_params = any(isinstance(p, DTensor) for p in model.parameters())
+        if not (should_load_checkpoint and has_sharded_params):
             try:
                 model.to(device, non_blocking=True)
             except NotImplementedError as e:
@@ -588,7 +597,6 @@ def apply_model_infrastructure(
         from nemo_automodel.components.distributed.cp_utils import (
             attach_context_parallel_hooks,
             attach_cp_sdpa_hooks,
-            attach_linear_attn_position_hooks,
         )
 
         is_compile_enabled = isinstance(model_wrapper, FSDP2Manager) and model_wrapper.enable_compile
@@ -597,7 +605,6 @@ def apply_model_infrastructure(
         model_parts = model.parts if hasattr(model, "parts") else [model]
         for mp in model_parts:
             attach_context_parallel_hooks(mp)
-            attach_linear_attn_position_hooks(mp)
             if is_compile_enabled:
                 attach_cp_sdpa_hooks(mp, cp_mesh)
 

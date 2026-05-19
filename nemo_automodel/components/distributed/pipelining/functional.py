@@ -36,6 +36,7 @@ from nemo_automodel.components.distributed.pipelining.hf_utils import (
     MULTIMODAL_SUFFIXES,
     TEXT_MODULE_ATTRS,
     get_text_module,
+    model_keeps_self_forward,
     patch_hf_model_for_pp,
 )
 
@@ -43,6 +44,8 @@ logger = logging.getLogger(__name__)
 
 
 class ParallelizeFnProtocol(Protocol):
+    """Callable protocol for applying distributed parallelism to a model."""
+
     def __call__(
         self,
         model: torch.nn.Module,
@@ -62,6 +65,7 @@ def scale_grads_by_divisor(
     stages: list[PipelineStage],
     divisor: int,
 ) -> None:
+    """Scale pipeline stage gradients by a common divisor when supported."""
     for stage in stages:
         if hasattr(stage, "scale_grads"):
             stage.scale_grads(divisor)
@@ -170,6 +174,7 @@ def calculate_virtual_stages(
     is_single_stage_schedule: bool,
     round_to_pp_multiple: str | None = None,
 ) -> tuple[int, int]:
+    """Calculate virtual pipeline stages and layers per stage."""
     if layers_per_stage is not None:
         # Calculate number of virtual stages needed (using ceiling division)
         # This allows for unequal distribution where stages can differ by at most 1 layer
@@ -480,6 +485,7 @@ def split_model_into_stages(
     is_v4_keep = getattr(getattr(model, "config", None), "model_type", None) == "deepseek_v4"
     has_rotary_emb_compress = is_v4_keep and hasattr(text_model, "rotary_emb_compress")
     has_hc_head = is_v4_keep and hasattr(text_model, "hc_head")
+    has_swa_rotary_emb = hasattr(text_model, "swa_rotary_emb")
 
     # Auto-generate module split if not provided
     if module_names_per_stage is None:
@@ -500,6 +506,9 @@ def split_model_into_stages(
         if has_rotary_emb_compress:
             for stage_modules in module_names_per_stage:
                 stage_modules.append(f"{layers_prefix}rotary_emb_compress")
+        if has_swa_rotary_emb:
+            for stage_modules in module_names_per_stage:
+                stage_modules.append(f"{layers_prefix}swa_rotary_emb")
         if has_hc_head:
             module_names_per_stage[-1].append(f"{layers_prefix}hc_head")
 
@@ -509,9 +518,18 @@ def split_model_into_stages(
         """Build a pipeline stage from specified module names."""
         # Deep copy the model
         stage_model = copy.deepcopy(model)
-        patch_hf_model_for_pp(
-            stage_model, patch_inner_model=patch_inner_model, patch_causal_lm_model=patch_causal_lm_model
-        )
+        # Two model implementation paths:
+        #   - HF / dedicated-patch path (LLMs, Gemma4 VLM, Mistral3 VLM): the
+        #     PP-aware forward lives in ``patch_hf_model_for_pp``.
+        #   - Custom-impl path that handles PP itself (Qwen3-VL-MoE, KimiVL,
+        #     Kimi-K2.5-VL, Qwen3.5-MoE): the model class declares
+        #     ``_pp_keep_self_forward = True`` so its own ``forward`` (which
+        #     pulls per-microbatch pixel_values from ``_vlm_pixel_values_chunks``)
+        #     stays intact.
+        if not model_keeps_self_forward(stage_model):
+            patch_hf_model_for_pp(
+                stage_model, patch_inner_model=patch_inner_model, patch_causal_lm_model=patch_causal_lm_model
+            )
         # Create a set of modules to keep
         modules_to_keep = set(module_names)
         modules_sorted = sorted(modules_to_keep, key=lambda x: x.split(".")[-1])
