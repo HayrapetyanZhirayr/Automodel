@@ -29,6 +29,7 @@ import time
 
 import torch
 from datasets import Dataset
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -57,10 +58,9 @@ def greedy_knapsack(lengths: list[int], max_length: int) -> list[list[int]]:
     heap: list[tuple[int, int]] = []
     bins: list[list[int]] = []
 
-    log_interval = max(1, N // 10)
     t0 = time.perf_counter()
 
-    for count, idx in enumerate(sorted_indices):
+    for idx in tqdm(sorted_indices, desc="Neat packing: knapsack", leave=False):
         length = lengths[idx]
         if length > max_length:
             continue  # handled by caller (drop or raise)
@@ -75,17 +75,6 @@ def greedy_knapsack(lengths: list[int], max_length: int) -> list[list[int]]:
             new_bin_idx = len(bins)
             bins.append([idx])
             heapq.heappush(heap, (length, new_bin_idx))
-
-        if (count + 1) % log_interval == 0:
-            elapsed = time.perf_counter() - t0
-            logger.info(
-                "  Greedy knapsack: %d/%d (%.0f%%) | %d bins | %.1fs",
-                count + 1,
-                N,
-                100.0 * (count + 1) / N,
-                len(bins),
-                elapsed,
-            )
 
     elapsed = time.perf_counter() - t0
     logger.info(
@@ -185,7 +174,7 @@ def neat_pack_dataset(
     lengths: list[int] = []
     n_dropped = 0
 
-    for sample in dataset:
+    for sample in tqdm(dataset, desc="Neat packing: scanning samples"):
         ids = sample["input_ids"]
         seq_len = len(ids) if isinstance(ids, list) else ids.shape[0]
 
@@ -229,7 +218,7 @@ def neat_pack_dataset(
 
     # Build packed samples
     packs: list[dict] = []
-    for bin_indices in bins:
+    for bin_indices in tqdm(bins, desc="Neat packing: building packs"):
         if max_packs is not None and len(packs) >= max_packs:
             break
         bin_samples = [samples[i] for i in bin_indices]
