@@ -85,6 +85,7 @@ from nemo_automodel.components.loggers.mlflow_utils import (
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.loss.fused_eaft_loss import FusedLinearEAFTLoss
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.optim.utils import build_dion_optimizer, is_dion_optimizer
@@ -841,7 +842,7 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
         The loss.
     """
     loss_fn_kwargs = {"num_label_tokens": kwargs.pop("num_label_tokens", None)}
-    if isinstance(loss_fn, FusedLinearCrossEntropy):
+    if isinstance(loss_fn, (FusedLinearCrossEntropy, FusedLinearEAFTLoss)):
         model = kwargs.pop("model")
         labels = kwargs.pop("labels")
 
@@ -1504,12 +1505,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             with train_ctx(), sync_ctx, fp8_ctx:
                 batch = filter_forward_kwargs(model, batch)
-                if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                if isinstance(self.loss_fn, (FusedLinearCrossEntropy, FusedLinearEAFTLoss)):
                     # use num_logits_to_keep to avoid full logits matrix in memory
                     out = model(logits_to_keep=1, **batch)
                     if "hidden_states" not in out:
                         raise ValueError(
-                            "FusedLinearCrossEntropy requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
+                            "FusedLinearCrossEntropy/FusedLinearEAFTLoss requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
                         )
                 else:
                     out = model(**batch)
