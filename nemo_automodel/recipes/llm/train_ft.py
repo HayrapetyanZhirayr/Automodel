@@ -744,7 +744,10 @@ def build_step_scheduler(cfg, dataloader, dp_group_size, local_batch_size):
         dataloader=dataloader,
     )
     if cfg is not None:
-        default_kwargs |= cfg.to_dict()
+        cfg_dict = cfg.to_dict()
+        # Runtime-only flag handled in run_train_validation_loop, not StepScheduler.
+        cfg_dict.pop("val_before_first_step", None)
+        default_kwargs |= cfg_dict
     return StepScheduler(**default_kwargs)
 
 
@@ -1368,15 +1371,27 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         for mp in self.model_parts:
             mp.train()
         self.timestamp = time.perf_counter()
+        cfg = getattr(self, "cfg", None)
+        val_before_first_step = bool(cfg.get("step_scheduler.val_before_first_step", False)) if cfg is not None else False
 
         pbar = self._make_progress_bar()
         try:
+            if val_before_first_step and self.step_scheduler.step == 0 and len(self.val_dataloaders) > 0:
+                logger.info("Running validation before first training step.")
+                for val_name, val_dataloader in self.val_dataloaders.items():
+                    val_log_data = self._run_validation_epoch(val_dataloader)
+                    self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
+                for mp in self.model_parts:
+                    mp.train()
+
             for epoch in self.step_scheduler.epochs:
                 self.step_scheduler.set_epoch(epoch)
                 # The step scheduler yields a list of batches with the following properties:
                 # 1. len(batches) == grad_acc_steps
                 # 2. len(batches[0]) == batch_size
                 for batches in self.step_scheduler:
+                    pad_token_id = 248044
+                    print(sum((b["input_ids"] != pad_token_id).sum() for b in batches))
                     # If QAT delayed fake-quant is configured, enable after threshold
                     self._enable_qat_if_delayed(self.step_scheduler.step)
                     train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
@@ -1407,6 +1422,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         )
                     self._maybe_collect_garbage()
         finally:
+
             if pbar is not None:
                 pbar.close()
         # Close JSONL loggers after training loop completes

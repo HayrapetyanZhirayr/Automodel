@@ -430,40 +430,40 @@ class LigerFusedKDSoftLoss(torch.nn.Module):
 
     def forward(
         self,
-        student_input: torch.Tensor,
-        student_weight: torch.Tensor,
-        teacher_input: torch.Tensor,
-        teacher_weight: torch.Tensor,
-        target: torch.LongTensor,
-        student_bias: torch.Tensor = None,
-        teacher_bias: torch.Tensor = None,
-        num_batch_labels: int = None,
+        student_hidden_states: torch.Tensor,
+        teacher_hidden_states: torch.Tensor,
+        labels: torch.LongTensor,
+        student_lm_weight: torch.Tensor,
+        teacher_lm_weight: torch.Tensor,
+        num_batch_labels: int | None = None,
     ) -> torch.Tensor:
         """
         Compute soft KD loss between teacher and student token distributions.
 
         Args:
-            student_input: Flattened student hidden states.
-            student_weight: Student output projection weight.
-            teacher_input: Flattened teacher hidden states.
-            teacher_weight: Teacher output projection weight.
-            target: Token labels used for ignore-index masking.
-            student_bias: Optional student output projection bias.
-            teacher_bias: Optional teacher output projection bias.
+            student_hidden_states: Flattened student hidden states.
+            teacher_hidden_states: Flattened teacher hidden states.
+            labels: Token labels used for ignore-index masking.
+            student_lm_weight: Student output projection weight.
+            teacher_lm_weight: Teacher output projection weight.
             num_batch_labels: Optional normalization denominator.
 
         Returns:
             torch.Tensor: Scalar soft KD loss.
         """
+        hidden_size = student_hidden_states.shape[-1]
+        student_hidden_states = student_hidden_states.view(-1, hidden_size)
+        teacher_hidden_states = teacher_hidden_states.view(-1, hidden_size)
+        labels = labels.view(-1)
 
         return LigerFusedLinearKDFunction.apply(
-            student_input,
-            student_weight,
-            teacher_input,
-            teacher_weight,
-            target,
-            student_bias,
-            teacher_bias,
+            student_hidden_states,
+            student_lm_weight,
+            teacher_hidden_states,
+            teacher_lm_weight,
+            labels,
+            None,  # student_bias
+            None,  # teacher_bias
             self.ignore_index,
             self.fp32_upcast,
             self.temperature,

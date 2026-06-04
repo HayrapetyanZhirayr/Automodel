@@ -59,6 +59,7 @@ from nemo_automodel.components.distributed.pipelining.config import PipelineConf
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.kd_loss import FusedLinearKDLoss
+from nemo_automodel.components.loss.fused_kd_loss import LigerFusedKDSoftLoss
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG
@@ -81,6 +82,12 @@ from nemo_automodel.recipes.llm.train_ft import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _count_modules_by_class_name(model: torch.nn.Module, class_name: str) -> int:
+    """Count modules whose class name exactly matches ``class_name``."""
+    return sum(1 for module in model.modules() if module.__class__.__name__ == class_name)
+
 
 def _format_duration(seconds: float) -> str:
     """Format seconds as human-readable duration (e.g., '2h 30m', '45m', '30s')."""
@@ -289,6 +296,75 @@ def _verify_tokenizer_compatibility(student_cfg, teacher_cfg, trust_remote_code=
 class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPrediction):
     """Fine-tune a student model via knowledge distillation."""
 
+    def _verify_cpaware_packing_patch(self, student_model: torch.nn.Module, teacher_model: torch.nn.Module) -> None:
+        """Verify student and teacher use the same Qwen packing patch modules."""
+        student_cpaware = _count_modules_by_class_name(student_model, "CPAwareGatedDeltaNet")
+        teacher_cpaware = _count_modules_by_class_name(teacher_model, "CPAwareGatedDeltaNet")
+        student_packed_layers = _count_modules_by_class_name(student_model, "Qwen3_5DecoderLayerWithPacking")
+        teacher_packed_layers = _count_modules_by_class_name(teacher_model, "Qwen3_5DecoderLayerWithPacking")
+
+        logger.info(
+            "Packing patch modules | student: cpaware=%d packed_layers=%d | teacher: cpaware=%d packed_layers=%d",
+            student_cpaware,
+            student_packed_layers,
+            teacher_cpaware,
+            teacher_packed_layers,
+        )
+
+        if student_cpaware == 0 or teacher_cpaware == 0:
+            raise RuntimeError(
+                "Expected CPAwareGatedDeltaNet to be present in both student and teacher, but at least one model has 0."
+            )
+        if student_cpaware != teacher_cpaware:
+            raise RuntimeError(
+                f"CPAwareGatedDeltaNet count mismatch: student={student_cpaware}, teacher={teacher_cpaware}."
+            )
+        if student_packed_layers != teacher_packed_layers:
+            raise RuntimeError(
+                f"Qwen3_5DecoderLayerWithPacking count mismatch: student={student_packed_layers}, "
+                f"teacher={teacher_packed_layers}."
+            )
+
+    def _verify_first_step_hidden_parity(
+        self,
+        student_model: torch.nn.Module,
+        student_batch: dict[str, torch.Tensor],
+        teacher_hidden_states: torch.Tensor,
+    ) -> None:
+        """One-time self-distillation parity check before backward (pre-lm_head hidden states)."""
+        was_training = student_model.training
+        try:
+            student_model.eval()
+            with torch.no_grad():
+                student_eval_out = student_model(logits_to_keep=1, output_hidden_states=True, **student_batch)
+                student_eval_hidden_states = get_final_hidden_states(student_eval_out)
+        finally:
+            student_model.train(was_training)
+
+        if student_eval_hidden_states is None:
+            raise RuntimeError("Student hidden states are missing during first-step parity verification.")
+
+        teacher_hidden_fp32 = teacher_hidden_states.to(dtype=torch.float32)
+        student_hidden_fp32 = student_eval_hidden_states.to(dtype=torch.float32)
+        abs_diff = (student_hidden_fp32 - teacher_hidden_fp32).abs()
+        max_abs_diff = float(abs_diff.max().item())
+        mean_abs_diff = float(abs_diff.mean().item())
+        is_close = torch.allclose(student_hidden_fp32, teacher_hidden_fp32, rtol=1e-3, atol=1e-3)
+
+        logger.info(
+            "First-step hidden parity (pre-lm_head): is_close=%s max_abs_diff=%.6e mean_abs_diff=%.6e",
+            is_close,
+            max_abs_diff,
+            mean_abs_diff,
+        )
+        if not is_close:
+            raise RuntimeError(
+                "Student/teacher hidden states mismatch on first training microbatch before backward. "
+                f"max_abs_diff={max_abs_diff:.6e}, mean_abs_diff={mean_abs_diff:.6e}"
+            )
+
+        del student_eval_out, student_eval_hidden_states, student_hidden_fp32, teacher_hidden_fp32, abs_diff
+
     def setup(self):  # noqa: C901 – same complexity as parent
         """Build student & teacher, dataloaders, optimizers, etc."""
         # Right now, we only support tokenizer compatibility for the same tokenizer.
@@ -302,6 +378,8 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         super().setup()
 
         self._offload_teacher_model = self.cfg.get("offload_teacher_model", False)
+        self._has_packed_sequence = self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0
+        self._first_step_hidden_parity_checked = False
         teacher_device = self.dist_env.device if not self._offload_teacher_model else "cpu"
 
         if self.pp_enabled:
@@ -314,7 +392,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             self.teacher_model = _build_teacher_model_with_pp(
                 cfg_teacher=self.cfg.get("teacher_model", None),
                 seed=self.cfg.get("seed", 42),
-                has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
+                has_packed_sequence=self._has_packed_sequence,
                 device_mesh=self.device_mesh,
                 moe_mesh=self.moe_mesh,
                 distributed_config=self.distributed_config,
@@ -333,7 +411,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 self.teacher_model = _build_teacher_model(
                     cfg_teacher=self.cfg.get("teacher_model", None),
                     seed=self.cfg.get("seed", 42),
-                    has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
+                    has_packed_sequence=self._has_packed_sequence,
                     device_mesh=self.device_mesh,
                     moe_mesh=self.moe_mesh,
                     distributed_config=self.distributed_config,
@@ -344,6 +422,8 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             self.teacher_pp = None
         import gc; gc.collect(); torch.cuda.empty_cache()
         logger.info("Teacher Model: " + str(self.teacher_model))
+        if self.is_kd_train and self._has_packed_sequence and not self.pp_enabled:
+            self._verify_cpaware_packing_patch(self.model_parts[0], self.teacher_model)
 
         # KD
         self.kd_loss_fn = _build_kd_loss_fn(self.cfg.get("kd_loss_fn", None))
@@ -430,7 +510,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             if is_train
             else nullcontext()
         )
-        kd_is_fused = isinstance(self.kd_loss_fn, FusedLinearKDLoss)
+        kd_is_fused = isinstance(self.kd_loss_fn, (FusedLinearKDLoss, LigerFusedKDSoftLoss))
         ce_is_fused = isinstance(self.loss_fn, FusedLinearCrossEntropy)
 
         if self.is_kd_train and not kd_is_fused and ce_is_fused:
@@ -508,13 +588,28 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                         )
                     student_lm_weight = _get_lm_head_weight(model)
                     kd_loss = self.kd_loss_fn(
-                        student_hidden_states,
-                        teacher_hidden_states,
-                        labels,
+                        student_hidden_states=student_hidden_states,
+                        teacher_hidden_states=teacher_hidden_states,
+                        labels=labels,
                         student_lm_weight=student_lm_weight,
                         teacher_lm_weight=teacher_lm_weight,
                         num_batch_labels=num_label_tokens,
                     )
+                    is_self_distillation = (
+                        self.cfg.teacher_model.pretrained_model_name_or_path == self.cfg.model.pretrained_model_name_or_path
+                    )
+                    if (
+                        is_train
+                        and is_self_distillation
+                        and not self._first_step_hidden_parity_checked
+                        and self._has_packed_sequence
+                    ):
+                        self._verify_first_step_hidden_parity(
+                            student_model=model,
+                            student_batch=student_batch,
+                            teacher_hidden_states=teacher_hidden_states,
+                        )
+                        self._first_step_hidden_parity_checked = True
                 else:
                     kd_loss = self.kd_loss_fn(
                         student_logits,
@@ -901,16 +996,13 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 local_loss, _kd_loss, _ce_loss = self._forward_backward_step(
                     0,
                     batch,
-                    num_label_tokens=1,
+                    num_label_tokens=None,
                     num_batches=1,
                     is_train=False,
                 )
-                # _forward_backward_step returns per-token-averaged losses.
-                # Multiply back by num_label_tokens to get the raw sum for
-                # correct weighted averaging across batches.
-                total_loss += local_loss.item() * num_label_tokens
-                total_ce_loss += _ce_loss.item() * num_label_tokens
-                total_kd_loss += _kd_loss.item() * num_label_tokens
+                total_loss += local_loss.item()
+                total_ce_loss += _ce_loss.item()
+                total_kd_loss += _kd_loss.item()
                 total_num_label_tokens += num_label_tokens
 
         total_loss = self._dp_allreduce(
