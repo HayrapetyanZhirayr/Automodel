@@ -36,9 +36,8 @@ from typing import Callable
 import torch
 import torch.utils.data
 
-from nemo_automodel.components.datasets.llm.neat_packing import (
-    greedy_knapsack,
-)
+from nemo_automodel.components.datasets.llm.neat_packing import greedy_knapsack
+from nemo_automodel.components.training.kd_dataset_config import raw_row_use_kd
 from nemo_automodel.components.datasets.vlm.samplers import (
     LengthGroupedSampler,
     _smart_resize_image,
@@ -327,6 +326,8 @@ def _build_packed_vlm_sample(
     pack_size: int,
     padding_idx: int,
     has_mrope: bool = False,
+    *,
+    use_kd: bool = True,
 ) -> dict:
     """Concatenate multiple shifted VLM samples into one packed sample."""
     all_input_ids: list[int] = []
@@ -392,6 +393,7 @@ def _build_packed_vlm_sample(
         "mm_token_type_ids": torch.tensor(all_mm_token_type_ids, dtype=torch.long),
         "n_images": n_images,
         "n_videos": n_videos,
+        "use_kd": use_kd,
     }
 
     if has_mrope and mrope_position_ids_list:
@@ -441,9 +443,11 @@ class PackedDatasetWrapper(torch.utils.data.Dataset):
         padding_idx: int = 0,
         get_rope_index: Callable | None = None,
         max_retries: int = 10,
+        bin_use_kd: list[bool] | None = None,
     ):
         self.inner = inner_dataset
         self.bins = bins
+        self.bin_use_kd = bin_use_kd if bin_use_kd is not None else [True] * len(bins)
         self.pack_size = pack_size
         self.padding_idx = padding_idx
         self.get_rope_index = get_rope_index
@@ -503,7 +507,13 @@ class PackedDatasetWrapper(torch.utils.data.Dataset):
             # Fallback: return a padding-only pack
             kept = [{"input_ids": torch.tensor([], dtype=torch.long), "labels": torch.tensor([], dtype=torch.long)}]
 
-        return _build_packed_vlm_sample(kept, self.pack_size, self.padding_idx, has_mrope=self.has_mrope)
+        return _build_packed_vlm_sample(
+            kept,
+            self.pack_size,
+            self.padding_idx,
+            has_mrope=self.has_mrope,
+            use_kd=self.bin_use_kd[pack_idx],
+        )
 
     def robust_collate(self, collate_fn):
         """Wrap collate_fn with retry logic, delegating to inner dataset."""
@@ -648,34 +658,61 @@ def neat_pack_dataset_vlm(
     # ── Stage 2: knapsack ────────────────────────────────────────
     has_visual = any(vt > 0 for vt in estimated_media_tokens)
     use_vt_balanced = balance_media_tokens and has_visual
+    has_kd_groups = ds_raw is not None and getattr(ds_raw, "kd_dataset_mask", None) is not None
 
-    if use_vt_balanced:
+    def _knapsack_local(local_indices: list[int]) -> list[list[int]]:
+        sub_lengths = [estimated_lengths[j] for j in local_indices]
+        sub_media = [estimated_media_tokens[j] for j in local_indices]
+        if use_vt_balanced:
+            return greedy_knapsack_vt_balanced(sub_lengths, knapsack_capacity, sub_media)
+        return greedy_knapsack(sub_lengths, knapsack_capacity)
+
+    bins: list[list[int]] = []
+    bin_use_kd: list[bool] = []
+    t1 = time.perf_counter()
+
+    if has_kd_groups:
+        groups: dict[bool, list[int]] = {True: [], False: []}
+        for local_j, global_idx in enumerate(valid_indices):
+            groups[raw_row_use_kd(ds_raw, global_idx)].append(local_j)
+        logger.info("Neat packing VLM: source-homogeneous knapsack on %d samples...", len(valid_indices))
+        for use_kd, local_indices in groups.items():
+            if not local_indices:
+                continue
+            for bin_local in _knapsack_local(local_indices):
+                bins.append([valid_indices[local_indices[i]] for i in bin_local])
+                bin_use_kd.append(use_kd)
+        logger.info(
+            "  Source-homogeneous packing: %d KD packs, %d CE-only packs",
+            sum(bin_use_kd),
+            len(bin_use_kd) - sum(bin_use_kd),
+        )
+    elif use_vt_balanced:
         logger.info(
             "Neat packing VLM: running VT-balanced knapsack on %d samples...",
             len(estimated_lengths),
         )
-        t1 = time.perf_counter()
         bins_local = greedy_knapsack_vt_balanced(
             estimated_lengths,
             knapsack_capacity,
             estimated_media_tokens,
         )
-        knapsack_elapsed = time.perf_counter() - t1
-        logger.info("  VT-balanced knapsack done in %.1fs.", knapsack_elapsed)
+        bins = [[valid_indices[j] for j in bin_local] for bin_local in bins_local]
+        bin_use_kd = [True] * len(bins)
     else:
         if balance_media_tokens and not has_visual:
             logger.info("Neat packing VLM: no visual samples detected, using standard knapsack.")
         logger.info("Neat packing VLM: running greedy knapsack on %d samples...", len(estimated_lengths))
-        t1 = time.perf_counter()
         bins_local = greedy_knapsack(estimated_lengths, knapsack_capacity)
-        knapsack_elapsed = time.perf_counter() - t1
-        logger.info("  Greedy knapsack done in %.1fs.", knapsack_elapsed)
+        bins = [[valid_indices[j] for j in bin_local] for bin_local in bins_local]
+        bin_use_kd = [True] * len(bins)
 
-    # Convert local bin indices back to real dataset indices
-    bins = [[valid_indices[j] for j in bin_local] for bin_local in bins_local]
+    knapsack_elapsed = time.perf_counter() - t1
+    logger.info("  Knapsack done in %.1fs.", knapsack_elapsed)
 
     if max_packs is not None:
         bins = bins[:max_packs]
+        bin_use_kd = bin_use_kd[:max_packs]
 
     # ── Packing statistics ──────────────────────────────────────
     total_est_tokens = sum(estimated_lengths)
@@ -718,4 +755,5 @@ def neat_pack_dataset_vlm(
         pack_size=pack_size,
         padding_idx=padding_idx,
         get_rope_index=get_rope_index,
+        bin_use_kd=bin_use_kd,
     )

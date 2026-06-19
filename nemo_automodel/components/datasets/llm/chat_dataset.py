@@ -18,7 +18,9 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Union
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Union
+
+from nemo_automodel.components.training.kd_dataset_config import parse_dataset_sources
 
 from datasets import VerificationMode, load_dataset
 from torch.utils.data import Dataset
@@ -39,9 +41,14 @@ def _is_hf_repo_id(val: str) -> bool:
     return not p.exists() and all(part for part in val.split("/"))
 
 
-def _as_iter(val: Union[str, Sequence[str]]) -> Iterator[str]:
+def _as_iter(val: Union[str, Sequence[str], Mapping[str, str]]) -> Iterator[str]:
     if isinstance(val, str):
         yield val
+    elif isinstance(val, Mapping):
+        for path in val.values():
+            if not isinstance(path, str):
+                raise ValueError("path_or_dataset_id mapping values must be strings")
+            yield path
     else:
         for x in val:
             if not isinstance(x, str):
@@ -66,7 +73,7 @@ def _parse_split_slice(split: Optional[str]):
 
 
 def _load_openai_messages(
-    path_or_dataset_id: Union[str, Sequence[str]],
+    path_or_dataset_id: Union[str, Sequence[str], Mapping[str, str]],
     split: Optional[str] = None,
     name: Optional[str] = None,
     shuffle_seed: Optional[int] = None,
@@ -84,7 +91,7 @@ def _load_openai_messages(
     inference issues (e.g., heterogeneous field types under `tools`).
 
     Args:
-        path_or_dataset_id: HF dataset ID or local file path(s).
+        path_or_dataset_id: HF dataset ID, local file path(s), or a mapping of alias -> path.
         split: Dataset split to load (e.g., "train", "train[1024:]").
         name: Dataset configuration/subset name
         shuffle_seed: Random seed for shuffling HF datasets before slicing.
@@ -142,13 +149,15 @@ def _load_openai_messages(
             return dataset
 
     # Fall back to manual JSON/JSONL parsing for local files.
-    files = list(_as_iter(path_or_dataset_id))
+    sources = parse_dataset_sources(path_or_dataset_id)
+    files = sources.paths
+    source_names = sources.names
     if not files:
         raise RuntimeError("No data files provided")
 
     rows: List[Dict[str, Any]] = []
 
-    def _read_file(fp: str) -> None:
+    def _read_file(fp: str, dataset_id: int, dataset_name: Optional[str]) -> None:
         p = Path(fp)
         if not p.exists():
             raise FileNotFoundError(f"File not found: {fp}")
@@ -160,11 +169,17 @@ def _load_openai_messages(
                 if not line:
                     continue
                 try:
-                    rows.append(json.loads(line))
+                    row = json.loads(line)
                 except json.JSONDecodeError:
                     if not skip_invalid_samples:
                         raise
                     skipped_lines += 1
+                    continue
+                if len(files) > 1:
+                    row["_source_dataset_id"] = dataset_id
+                    if dataset_name is not None:
+                        row["_source_dataset_name"] = dataset_name
+                rows.append(row)
             if skipped_lines:
                 logging.getLogger(__name__).warning(
                     "Skipped %d malformed JSONL line(s) from %s (skip_invalid_samples=True)",
@@ -174,12 +189,23 @@ def _load_openai_messages(
         else:
             obj = json.loads(text)
             if isinstance(obj, list):
-                rows.extend(obj)
+                for row in obj:
+                    if len(files) > 1 and isinstance(row, dict):
+                        row = dict(row)
+                        row["_source_dataset_id"] = dataset_id
+                        if dataset_name is not None:
+                            row["_source_dataset_name"] = dataset_name
+                    rows.append(row)
             else:
+                if len(files) > 1 and isinstance(obj, dict):
+                    obj = dict(obj)
+                    obj["_source_dataset_id"] = dataset_id
+                    if dataset_name is not None:
+                        obj["_source_dataset_name"] = dataset_name
                 rows.append(obj)
 
-    for f in files:
-        _read_file(f)
+    for dataset_id, f in enumerate(files):
+        _read_file(f, dataset_id, source_names[dataset_id] if dataset_id < len(source_names) else None)
 
     return rows
 
@@ -284,7 +310,7 @@ class ChatDataset(Dataset):
 
     def __init__(
         self,
-        path_or_dataset_id: Union[str, Sequence[str]],
+        path_or_dataset_id: Union[str, Sequence[str], Mapping[str, str]],
         tokenizer,
         *,
         split: Optional[str] = None,
@@ -298,11 +324,13 @@ class ChatDataset(Dataset):
         mask_reasoning_content: bool = False,
         unshifted: bool = False,
         skip_invalid_samples: bool = False,
+        kd_dataset_mask: Optional[Sequence[bool]] = None,
     ) -> None:
         """Load OpenAI-format chat rows and tokenize via the chat template.
 
         Args:
-            path_or_dataset_id: Hugging Face dataset id, local JSON/JSONL path(s), Parquet file, or Parquet directory.
+            path_or_dataset_id: Hugging Face dataset id, local JSON/JSONL path(s), a mapping of
+                alias -> path, Parquet file, or Parquet directory.
             tokenizer: Tokenizer with chat template support (required).
             split: Dataset split or slice (e.g. ``train``, ``train[1024:]``).
             name: Optional Hub subset / config name.
@@ -317,6 +345,8 @@ class ChatDataset(Dataset):
             skip_invalid_samples: If ``True``, skip malformed JSONL lines when reading local files (warning logs
                 include skip counts). If ``False``, a bad line raises. Does not skip invalid structured rows after
                 load; those still raise when a sample is accessed.
+            kd_dataset_mask: Optional per-source KD flags aligned with ``path_or_dataset_id``. When set,
+                each sample includes ``kd_token_mask`` indicating which tokens should receive KL loss.
         """
         if tokenizer is None:
             raise ValueError("Tokenizer is required")
@@ -336,6 +366,9 @@ class ChatDataset(Dataset):
         self.mask_reasoning_content = mask_reasoning_content
         self.unshifted = unshifted
         self.skip_invalid_samples = skip_invalid_samples
+        self.kd_dataset_mask = None
+        if kd_dataset_mask is not None:
+            self.kd_dataset_mask = [bool(v) for v in kd_dataset_mask]
 
         self.dataset = _load_openai_messages(
             path_or_dataset_id,
@@ -376,4 +409,13 @@ class ChatDataset(Dataset):
             mask_reasoning_content=self.mask_reasoning_content,
             unshifted=self.unshifted,
         )
+        if self.kd_dataset_mask is not None:
+            source_id = row.get("_source_dataset_id", 0)
+            if source_id < 0 or source_id >= len(self.kd_dataset_mask):
+                raise ValueError(
+                    f"Sample source dataset id {source_id} is out of range for kd_dataset_mask "
+                    f"(len={len(self.kd_dataset_mask)})"
+                )
+            use_kd = self.kd_dataset_mask[source_id]
+            sample["use_kd"] = use_kd
         return sample

@@ -168,6 +168,7 @@ class KDLoss(nn.Module):
         teacher_logits: torch.Tensor,
         labels: torch.Tensor,
         num_batch_labels: int | None = None,
+        kd_token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute the KD loss.
 
@@ -178,6 +179,8 @@ class KDLoss(nn.Module):
             num_batch_labels: Total number of valid tokens across all gradient-accumulation steps.
                 When provided the loss is ``sum(kl_per_token) / num_batch_labels``; otherwise it
                 is ``mean(kl_per_token)`` over the valid tokens in this micro-batch.
+            kd_token_mask: Optional per-token mask in ``[0, 1]``. When provided, KL is accumulated
+                only for tokens where the mask is positive.
 
         Returns:
             Scalar KD loss.
@@ -194,6 +197,12 @@ class KDLoss(nn.Module):
             teacher_logits = teacher_logits.view(-1, teacher_logits.shape[-1])
         if labels.ndim > 1:
             labels = labels.view(-1)
+
+        if kd_token_mask is not None:
+            if kd_token_mask.ndim > 1:
+                kd_token_mask = kd_token_mask.view(-1)
+            if _HAVE_DTENSOR and isinstance(kd_token_mask, DTensor):
+                kd_token_mask = kd_token_mask.full_tensor()
 
         # Determine TP group: prefer explicit argument, then auto-detect from DTensor.
         tp_group = self.tp_group
@@ -217,6 +226,10 @@ class KDLoss(nn.Module):
 
         t_logits = teacher_logits[valid_mask]
         s_logits = student_logits[valid_mask]
+        if kd_token_mask is not None:
+            token_mask = kd_token_mask[valid_mask].to(dtype=s_logits.dtype)
+        else:
+            token_mask = None
 
         # Up-cast to fp32 for numerical stability and apply temperature scaling.
         if self.fp32_upcast:
@@ -242,6 +255,9 @@ class KDLoss(nn.Module):
         # T² to keep gradient magnitudes independent of temperature (Hinton et al., 2015).
         if self.temperature != 1.0:
             kl_per_token = kl_per_token * (self.temperature**2)
+
+        if token_mask is not None:
+            kl_per_token = kl_per_token * token_mask
 
         # kl_per_token = sum(P * log Q) ≤ 0.  Negate to obtain a positive minimisation target.
         if num_batch_labels is not None:
@@ -294,6 +310,7 @@ class FusedLinearKDLoss(nn.Module):
         student_lm_weight: torch.Tensor,
         teacher_lm_weight: torch.Tensor,
         num_batch_labels: int | None = None,
+        kd_token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute the chunked KD loss from hidden states.
 
@@ -306,6 +323,8 @@ class FusedLinearKDLoss(nn.Module):
             num_batch_labels: Total valid tokens across gradient-accumulation steps.
                 When provided: loss = ``sum(kl) / num_batch_labels``.
                 When ``None``: loss = ``mean(kl)`` over valid tokens in this micro-batch.
+            kd_token_mask: Optional per-token mask in ``[0, 1]``. When provided, KL is accumulated
+                only for tokens where the mask is positive.
 
         Returns:
             Scalar KD loss.
@@ -322,6 +341,10 @@ class FusedLinearKDLoss(nn.Module):
 
         s_hs = s_hs[valid_mask]
         t_hs = t_hs[valid_mask]
+        if kd_token_mask is not None:
+            token_mask = kd_token_mask.view(-1)[valid_mask].to(dtype=s_hs.dtype)
+        else:
+            token_mask = None
 
         vocab_size = student_lm_weight.shape[0]
         chunk_size = self.chunk_size or max(1, min(n_valid, 8 * 1024 * 1024 // max(vocab_size, 1)))
@@ -353,7 +376,10 @@ class FusedLinearKDLoss(nn.Module):
             student_log_prob = F.log_softmax(s_logits, dim=-1)
 
             # sum(P * log Q) summed over chunk tokens → scalar contribution.
-            kl_sum = kl_sum + teacher_prob.mul(student_log_prob).sum()
+            chunk_kl = teacher_prob.mul(student_log_prob).sum(dim=-1)
+            if token_mask is not None:
+                chunk_kl = chunk_kl * token_mask[start:end]
+            kl_sum = kl_sum + chunk_kl.sum()
 
             del s_logits, t_logits, teacher_prob, student_log_prob
 

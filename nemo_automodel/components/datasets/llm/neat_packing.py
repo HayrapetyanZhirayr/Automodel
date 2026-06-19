@@ -87,10 +87,24 @@ def greedy_knapsack(lengths: list[int], max_length: int) -> list[list[int]]:
     return bins
 
 
+def _sample_use_kd(sample: dict) -> bool:
+    """Return whether a sample should use KD (defaults to True for legacy data)."""
+    if "use_kd" in sample:
+        return bool(sample["use_kd"])
+    if "kd_token_mask" in sample:
+        kd_mask = sample["kd_token_mask"]
+        if isinstance(kd_mask, torch.Tensor):
+            return bool((kd_mask > 0).any().item())
+        return any(float(v) > 0 for v in kd_mask)
+    return True
+
+
 def _build_packed_sample(
     samples: list[dict],
     pack_size: int,
     padding_idx: int,
+    *,
+    use_kd: bool | None = None,
 ) -> dict:
     """Concatenate multiple samples into a single packed sample.
 
@@ -108,6 +122,15 @@ def _build_packed_sample(
     all_labels: list[int] = []
     all_attention_mask: list[int] = []
     all_position_ids: list[int] = []
+
+    if use_kd is None:
+        use_kd_flags = {_sample_use_kd(sample) for sample in samples}
+        if len(use_kd_flags) > 1:
+            raise ValueError(
+                "Neat packing mixed KD and CE-only samples in one pack. "
+                "Enable source-homogeneous packing (default when use_kd is set on samples)."
+            )
+        use_kd = next(iter(use_kd_flags)) if use_kd_flags else True
 
     for seq_idx, sample in enumerate(samples, start=1):
         ids = sample["input_ids"]
@@ -134,12 +157,14 @@ def _build_packed_sample(
         all_attention_mask.extend([0] * pad_len)
         all_position_ids.extend([0] * pad_len)
 
-    return {
+    packed = {
         "input_ids": torch.tensor(all_input_ids, dtype=torch.long),
         "labels": torch.tensor(all_labels, dtype=torch.long),
         "attention_mask": torch.tensor(all_attention_mask, dtype=torch.long),
         "position_ids": torch.tensor(all_position_ids, dtype=torch.long),
+        "use_kd": use_kd,
     }
+    return packed
 
 
 def neat_pack_dataset(
@@ -207,22 +232,41 @@ def neat_pack_dataset(
     if not samples:
         raise ValueError("No samples remaining after filtering.")
 
-    # Run greedy knapsack
-    bins = greedy_knapsack(lengths, pack_size)
-    logger.info(
-        "Greedy knapsack: %d samples -> %d packs (avg utilization: %.1f%%)",
-        len(samples),
-        len(bins),
-        100.0 * sum(lengths) / (len(bins) * pack_size) if bins else 0,
-    )
+    has_kd_groups = any("use_kd" in sample or "kd_token_mask" in sample for sample in samples)
+    all_bins: list[tuple[bool, list[int]]] = []
+    if has_kd_groups:
+        groups: dict[bool, list[int]] = {True: [], False: []}
+        for idx, sample in enumerate(samples):
+            groups[_sample_use_kd(sample)].append(idx)
+        for use_kd, indices in groups.items():
+            if not indices:
+                continue
+            group_lengths = [lengths[i] for i in indices]
+            group_bins = greedy_knapsack(group_lengths, pack_size)
+            for bin_local in group_bins:
+                all_bins.append((use_kd, [indices[i] for i in bin_local]))
+        logger.info(
+            "Source-homogeneous neat packing: %d KD packs, %d CE-only packs",
+            sum(1 for use_kd, _ in all_bins if use_kd),
+            sum(1 for use_kd, _ in all_bins if not use_kd),
+        )
+    else:
+        bins = greedy_knapsack(lengths, pack_size)
+        all_bins = [(True, bin_indices) for bin_indices in bins]
+        logger.info(
+            "Greedy knapsack: %d samples -> %d packs (avg utilization: %.1f%%)",
+            len(samples),
+            len(all_bins),
+            100.0 * sum(lengths) / (len(all_bins) * pack_size) if all_bins else 0,
+        )
 
     # Build packed samples
     packs: list[dict] = []
-    for bin_indices in tqdm(bins, desc="Neat packing: building packs"):
+    for use_kd, bin_indices in tqdm(all_bins, desc="Neat packing: building packs"):
         if max_packs is not None and len(packs) >= max_packs:
             break
         bin_samples = [samples[i] for i in bin_indices]
-        packed = _build_packed_sample(bin_samples, pack_size, padding_idx)
+        packed = _build_packed_sample(bin_samples, pack_size, padding_idx, use_kd=use_kd)
         packs.append(packed)
 
     logger.info("Total number of packs created: %d", len(packs))

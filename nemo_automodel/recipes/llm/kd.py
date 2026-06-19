@@ -61,6 +61,8 @@ from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.kd_loss import FusedLinearKDLoss
 from nemo_automodel.components.loss.fused_kd_loss import LigerFusedKDSoftLoss
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.training.kd_dataset_config import apply_kd_dataset_mask_to_cfg
+from nemo_automodel.components.training.kd_loss_utils import combine_kd_ce_loss, parse_batch_use_kd
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.utils import (
@@ -387,6 +389,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         # We will add support for different tokenizers in the future.
         self.kd_ratio: float = float(self.cfg.get("kd_ratio", 0.5))
         self.is_kd_train = (self.kd_ratio != 0.0)
+        self._kd_dataset_mask = apply_kd_dataset_mask_to_cfg(self.cfg)
         if self.is_kd_train:
             _verify_tokenizer_compatibility(self.cfg.get("model", None), self.cfg.get("teacher_model", None))
 
@@ -513,8 +516,11 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 "_forward_backward_step should not be called when pp_enabled; use _forward_backward_step_pp instead."
             )
         batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
+        use_kd = parse_batch_use_kd(batch.pop("use_kd", None))
         labels = batch.pop("labels")
-        train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
+        batch["labels"] = labels
+        train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
+        labels = batch.pop("labels")
 
         model = self.model_parts[0]
         sync_ctx = (
@@ -536,7 +542,8 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             )
 
         with train_ctx(), sync_ctx:
-            if self.is_kd_train:
+            run_teacher = self.is_kd_train and self.kd_ratio > 0.0 and (use_kd is None or use_kd)
+            if run_teacher:
                 # No grad for teacher forward.
                 with (
                     ScopedModuleOffloading(self.teacher_model, enabled=self._offload_teacher_model),
@@ -558,8 +565,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                         teacher_logits = getattr(teacher_out, "logits", teacher_out).detach()
                         teacher_hidden_states = None  # not needed so setting to None
             else:
-                teacher_batch = teacher_out = teacher_logits = teacher_hidden_states = None
-
+                teacher_batch = teacher_out = teacher_logits = teacher_hidden_states = teacher_lm_weight = None
 
             # Student forward.
             student_batch = filter_forward_kwargs(model, batch)
@@ -573,12 +579,14 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 student_logits = getattr(student_out, "logits", student_out)  # shape (B, S, V)
 
             # Cross-entropy loss against true labels (skip when kd_ratio >= 1.0).
-            if self.kd_ratio >= 1.0:
-                is_self_distilation = (self.cfg.teacher_model.pretrained_model_name_or_path == self.cfg.model.pretrained_model_name_or_path)
-                if is_self_distilation:
-                   raise ValueError(
-                    "Self-distillation with kd_ratio >= 1.0 results in zero training signal "
-                    "because teacher and student are initially identical and only KL loss is used."
+            if self.kd_ratio >= 1.0 and use_kd is not False:
+                is_self_distilation = (
+                    self.cfg.teacher_model.pretrained_model_name_or_path == self.cfg.model.pretrained_model_name_or_path
+                )
+                if is_self_distilation and use_kd is not False:
+                    raise ValueError(
+                        "Self-distillation with kd_ratio >= 1.0 results in zero training signal "
+                        "because teacher and student are initially identical and only KL loss is used."
                     )
                 ce_loss = None
             else:
@@ -594,7 +602,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             # Reminder: kd_loss is normalized by num_label_tokens, which is typically
             # larger than the number of labels in this batch alone because it covers all
             # batches in one optimizer step (grad_acc_steps = gbs / mbs).
-            if self.kd_ratio != 0.0:
+            if run_teacher:
                 if kd_is_fused:
                     student_hidden_states = get_final_hidden_states(student_out)
                     if student_hidden_states is None:
@@ -612,7 +620,8 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                         num_batch_labels=num_label_tokens,
                     )
                     is_self_distillation = (
-                        self.cfg.teacher_model.pretrained_model_name_or_path == self.cfg.model.pretrained_model_name_or_path
+                        self.cfg.teacher_model.pretrained_model_name_or_path
+                        == self.cfg.model.pretrained_model_name_or_path
                     )
                     if (
                         is_train
@@ -634,12 +643,20 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                         num_batch_labels=num_label_tokens,
                     )
             else:
-                kd_loss = torch.tensor(0.0)
-            local_loss = (1.0 - self.kd_ratio) * ce_loss + self.kd_ratio * kd_loss    
+                kd_loss = torch.tensor(0.0, device=self.dist_env.device)
+            if ce_loss is None:
+                local_loss = self.kd_ratio * kd_loss
+            else:
+                local_loss = combine_kd_ce_loss(ce_loss, kd_loss, self.kd_ratio, use_kd)
             if is_train:
                 (local_loss * self._get_dp_group_size(include_cp=True)).backward()
             detached_local = local_loss.detach().clone()
-            return detached_local, kd_loss.detach().clone(), ce_loss.detach().clone()
+            detached_ce = (
+                ce_loss.detach().clone()
+                if ce_loss is not None
+                else torch.tensor(0.0, device=self.dist_env.device)
+            )
+            return detached_local, kd_loss.detach().clone(), detached_ce
 
     def _forward_backward_step_pp(
         self,

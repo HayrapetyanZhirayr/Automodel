@@ -450,6 +450,8 @@ def neat_packed_collater(batch: list[dict], attn_implementation: str = "sdpa") -
     }
     if attention_mask.max() > 1:
         result["_packed_seq_ids"] = attention_mask
+    if "use_kd" in batch[0]:
+        result["use_kd"] = torch.tensor([bool(x["use_kd"]) for x in batch], dtype=torch.bool)
     return result
 
 

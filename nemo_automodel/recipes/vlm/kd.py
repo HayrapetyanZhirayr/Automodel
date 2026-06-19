@@ -56,6 +56,8 @@ from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
+from nemo_automodel.components.training.kd_dataset_config import apply_kd_dataset_mask_to_cfg
+from nemo_automodel.components.training.kd_loss_utils import combine_kd_ce_loss, parse_batch_use_kd
 from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.utils import (
     ScopedModuleOffloading,
@@ -193,6 +195,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
     def setup(self):
         """Build student & teacher, dataloaders, optimizers, etc."""
         _verify_tokenizer_compatibility(self.cfg.get("model", None), self.cfg.get("teacher_model", None))
+        self._kd_dataset_mask = apply_kd_dataset_mask_to_cfg(self.cfg)
 
         super().setup()
 
@@ -262,6 +265,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
 
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
         labels = batch.pop("labels")
+        use_kd = parse_batch_use_kd(batch.pop("use_kd", None))
 
         model = self.model_parts[0]
         sync_ctx = (
@@ -274,15 +278,19 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             else nullcontext()
         )
         with sync_ctx, train_ctx():
-            # Teacher forward (no grad) — free intermediates immediately.
-            with (
-                ScopedModuleOffloading(self.teacher_model, enabled=self._offload_teacher_model),
-                torch.no_grad(),
-            ):
-                teacher_batch = filter_forward_kwargs(self.teacher_model, batch)
-                teacher_out = self.teacher_model(**teacher_batch)
-                teacher_logits = getattr(teacher_out, "logits", teacher_out).detach().clone()
-                del teacher_out, teacher_batch
+            run_teacher = self.kd_ratio > 0.0 and (use_kd is None or use_kd)
+            if run_teacher:
+                # Teacher forward (no grad) — free intermediates immediately.
+                with (
+                    ScopedModuleOffloading(self.teacher_model, enabled=self._offload_teacher_model),
+                    torch.no_grad(),
+                ):
+                    teacher_batch = filter_forward_kwargs(self.teacher_model, batch)
+                    teacher_out = self.teacher_model(**teacher_batch)
+                    teacher_logits = getattr(teacher_out, "logits", teacher_out).detach().clone()
+                    del teacher_out, teacher_batch
+            else:
+                teacher_logits = None
 
             # Student forward.
             student_batch = filter_forward_kwargs(model, batch)
@@ -299,8 +307,8 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             )
             del student_out
 
-            # CE loss (skip when kd_ratio >= 1.0).
-            if self.kd_ratio >= 1.0:
+            # CE loss (skip when kd_ratio >= 1.0 on a KD pack).
+            if self.kd_ratio >= 1.0 and use_kd is not False:
                 ce_loss = student_logits.new_tensor(0.0, dtype=student_logits.dtype)
             else:
                 ce_loss = calculate_loss(
@@ -313,15 +321,18 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
                 )
             del hidden_states
 
-            kd_loss = self.kd_loss_fn(
-                student_logits,
-                teacher_logits,
-                labels,
-                num_batch_labels=num_label_tokens,
-            )
+            if run_teacher:
+                kd_loss = self.kd_loss_fn(
+                    student_logits,
+                    teacher_logits,
+                    labels,
+                    num_batch_labels=num_label_tokens,
+                )
+            else:
+                kd_loss = student_logits.new_tensor(0.0, dtype=student_logits.dtype)
             del teacher_logits
 
-            local_loss = (1.0 - self.kd_ratio) * ce_loss + self.kd_ratio * kd_loss
+            local_loss = combine_kd_ce_loss(ce_loss, kd_loss, self.kd_ratio, use_kd)
             loss_buffer.append(local_loss.detach().clone())
             self._ce_loss_buffer.append(ce_loss.detach().clone())
             self._kd_loss_buffer.append(kd_loss.detach().clone())

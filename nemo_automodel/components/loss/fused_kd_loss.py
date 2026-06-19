@@ -17,8 +17,9 @@ class LigerFusedLinearKDBase(torch.autograd.Function):
         teacher_logits,
         target,
         ignore_index=-100,
-        fp32_upcast=True, 
+        fp32_upcast=True,
         temperature=1.0,
+        kd_token_mask=None,
     ):
         """
         Compute a soft KD loss term on logits for a single chunk.
@@ -62,6 +63,8 @@ class LigerFusedLinearKDBase(torch.autograd.Function):
         
         # Apply ignore_index mask
         mask = target != ignore_index
+        if kd_token_mask is not None:
+            mask = mask & (kd_token_mask.reshape(-1) > 0)
         kd_loss_per_token = kd_loss_per_token.masked_fill(~mask, 0.0)
 
         return kd_loss_per_token.sum()
@@ -176,7 +179,11 @@ class LigerFusedLinearKDBase(torch.autograd.Function):
             # student_logits_chunk = torch.cat([student_logits_chunk, pad_tensor], dim=-1)
 
         soft_loss = distillation_loss_fn(
-            student_logits_chunk, teacher_logits_chunk, target=target_chunk, ignore_index=ignore_index, **loss_kwargs
+            student_logits_chunk,
+            teacher_logits_chunk,
+            target=target_chunk,
+            ignore_index=ignore_index,
+            **loss_kwargs,
         )
 
         if num_batch_labels is not None:
@@ -314,7 +321,6 @@ class LigerFusedLinearKDBase(torch.autograd.Function):
         _student_input_chunks = torch.chunk(student_input, chunks=num_chunks, dim=0)
         _teacher_input_chunks = torch.chunk(teacher_input, chunks=num_chunks, dim=0)
         _target_chunks = torch.chunk(target, chunks=num_chunks, dim=0)
-
         for student_input_chunk, teacher_input_chunk, target_chunk in zip(
             _student_input_chunks, _teacher_input_chunks, _target_chunks
         ):
