@@ -41,10 +41,14 @@ def dummy_model() -> nn.Module:
             self.vision_tower = nn.Sequential(nn.Linear(4, 4))  # vision tower attr
             self.visual_extra = nn.Sequential(nn.Linear(5, 5))  # triggers "visual" name pattern
             self.language_model = nn.Sequential(nn.Linear(6, 6))
+            self.lm_head = nn.Linear(6, 10)
             self.other = nn.Linear(7, 7)
 
         def forward(self, x):  # pragma: no cover
             pass
+
+        def get_output_embeddings(self):
+            return self.lm_head
 
     return DummyModel()
 
@@ -93,22 +97,27 @@ def test_print_trainable_parameters_non_zero_rank(dummy_model, capsys, monkeypat
         (
             # freeze_vision_tower=False means vision stays trainable
             {"freeze_vision_tower": False, "freeze_language_model": False},
-            {"vision": True, "lang": True, "other": True},
+            {"vision": True, "lang": True, "lm_head": True, "other": True},
         ),
         (
             # freeze_vision_tower=True means vision is frozen
             {"freeze_vision_tower": True, "freeze_language_model": False},
-            {"vision": False, "lang": True, "other": True},
+            {"vision": False, "lang": True, "lm_head": True, "other": True},
         ),
         (
             # freeze_language_model=True means language_model is frozen
             {"freeze_vision_tower": False, "freeze_language_model": True},
-            {"vision": True, "lang": False, "other": True},
+            {"vision": True, "lang": False, "lm_head": False, "other": True},
         ),
         (
             # defaults: freeze_vision_tower=True, freeze_language_model=False
             {},
-            {"vision": False, "lang": True, "other": True},
+            {"vision": False, "lang": True, "lm_head": True, "other": True},
+        ),
+        (
+            # freeze LM backbone only; keep lm_head trainable
+            {"freeze_vision_tower": False, "freeze_language_model": True, "freeze_lm_head": False},
+            {"vision": True, "lang": False, "lm_head": True, "other": True},
         ),
     ],
 )
@@ -137,6 +146,7 @@ def test_apply_parameter_freezing(dummy_model, freeze_cfg: Dict, expect: Dict):
 
     # language model
     assert _all_requires_grad(dummy_model.language_model) is expect["lang"]
+    assert _all_requires_grad(dummy_model.lm_head) is expect["lm_head"]
 
     # unrelated layer (including embeddings - not frozen by this function)
     assert dummy_model.other.weight.requires_grad is expect["other"]

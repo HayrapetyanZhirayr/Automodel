@@ -280,6 +280,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         has_packed_sequence = kwargs.pop("has_packed_sequence", False)
         freeze_config = kwargs.pop("freeze_config", None)
         cache_dir = kwargs.pop("cache_dir", hf_constants.HF_HUB_CACHE)
+        skip_param_summary = kwargs.pop("skip_param_summary", False)
+        param_summary_label = kwargs.pop("param_summary_label", None)
 
         def _retry(**override):
             """Re-enter ``_build_model`` with overridden parameters."""
@@ -290,6 +292,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 "has_packed_sequence": has_packed_sequence,
                 "freeze_config": freeze_config,
                 "cache_dir": cache_dir,
+                "skip_param_summary": skip_param_summary,
+                "param_summary_label": param_summary_label,
             }
             return cls._build_model(
                 pretrained_model_name_or_path_or_config,
@@ -488,6 +492,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             freeze_config=freeze_config,
             weights_already_loaded=weights_already_loaded,
             inject_te_attention=inject_te_attention,
+            skip_param_summary=skip_param_summary,
+            param_summary_label=param_summary_label,
         )
 
         return model

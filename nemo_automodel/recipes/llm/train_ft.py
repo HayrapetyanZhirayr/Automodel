@@ -201,6 +201,7 @@ def build_model(
     activation_checkpointing=False,
     unfreeze_modules: list[str] | None = None,
     sdpa_method: list[str] | None = None,
+    skip_param_summary: bool = False,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """Build and initialize a model.
 
@@ -233,6 +234,7 @@ def build_model(
             "distributed_config": distributed_config,
             "pipeline_config": pipeline_config,
             "sdpa_method": sdpa_method,
+            "skip_param_summary": skip_param_summary,
         }
 
         if cfg_qat is not None and cfg_qat.get("enabled", False):

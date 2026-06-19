@@ -223,11 +223,12 @@ def count_model_parameters(model: nn.Module) -> tuple[int, int]:
 
 
 @torch.no_grad()
-def print_trainable_parameters(model: nn.Module) -> tuple[int, int]:
+def print_trainable_parameters(model: nn.Module, label: str | None = None) -> tuple[int, int]:
     """Print the number of trainable parameters in the model.
 
     Args:
         model: Model to analyze
+        label: Optional label prefix (e.g. ``"Student"`` or ``"Teacher"``).
 
     Returns:
         trainable_params: int
@@ -240,7 +241,8 @@ def print_trainable_parameters(model: nn.Module) -> tuple[int, int]:
         local_sq_norm = float(local_sq_norm**0.5)
         trainable_pct = (100.0 * trainable_params / total_params) if total_params > 0 else 0.0
 
-        logging.info("Model summary:")
+        summary_title = f"{label} model summary:" if label else "Model summary:"
+        logging.info(summary_title)
         logging.info("--------------------------------")
         logging.info(f"Trainable parameters: {trainable_params:,}")
         logging.info(f"Total parameters: {total_params:,}")
@@ -273,6 +275,25 @@ def _freeze_module_by_attribute_and_patterns(model, attribute_name, name_pattern
                 param.requires_grad = False
 
 
+def _freeze_lm_head(model):
+    """Freeze the output projection (lm_head / output embeddings)."""
+    if hasattr(model, "lm_head"):
+        for param in model.lm_head.parameters():
+            param.requires_grad = False
+
+    get_output_embeddings = getattr(model, "get_output_embeddings", None)
+    if callable(get_output_embeddings):
+        output_embeddings = get_output_embeddings()
+        if output_embeddings is not None:
+            for param in output_embeddings.parameters():
+                param.requires_grad = False
+
+    for name, module in model.named_modules():
+        if "lm_head" in name.lower():
+            for param in module.parameters():
+                param.requires_grad = False
+
+
 def apply_parameter_freezing(model, freeze_config):
     """Apply parameter freezing based on configuration.
 
@@ -284,6 +305,7 @@ def apply_parameter_freezing(model, freeze_config):
         - freeze_vision_tower: bool (default True)
         - freeze_audio_tower: bool (default False)
         - freeze_language_model: bool (default False)
+        - freeze_lm_head: bool (default: same as freeze_language_model)
     """
     freeze_vision_tower = freeze_config.get("freeze_vision_tower", True)
     freeze_audio_tower = freeze_config.get("freeze_audio_tower", False)
@@ -300,6 +322,12 @@ def apply_parameter_freezing(model, freeze_config):
     # Freeze language model backbone
     if freeze_language_model:
         _freeze_module_by_attribute_and_patterns(model, "language_model", ["language", "text", "llm"])
+
+    # Freeze output head when requested. Defaults to the same value as freeze_language_model
+    # so that a fully frozen LM (e.g. KD teacher) also freezes lm_head / output embeddings.
+    freeze_lm_head = freeze_config.get("freeze_lm_head", freeze_language_model)
+    if freeze_lm_head:
+        _freeze_lm_head(model)
 
     # Phi4MM: cast internal fp32 LoRA adapters to bf16 for FSDP2 compatibility,
     # and disable KV cache (remote code uses legacy DynamicCache.key_cache

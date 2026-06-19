@@ -71,7 +71,7 @@ from nemo_automodel.components.training.utils import (
     prepare_for_grad_accumulation,
     scale_grads_and_clip_grad_norm,
 )
-from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
+from nemo_automodel.components.utils.model_utils import filter_forward_kwargs, print_trainable_parameters
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     _get_num_thd_chunks,
@@ -171,6 +171,7 @@ def _build_teacher_model(
             "device_mesh": device_mesh,
             "moe_mesh": moe_mesh,
             "distributed_config": distributed_config,
+            "skip_param_summary": True,
         }
 
         teacher_model = cfg_teacher.instantiate(**kwargs)
@@ -182,6 +183,13 @@ def _build_teacher_model(
         teacher_model.eval()
         for p in teacher_model.parameters():
             p.requires_grad_(False)
+
+        trainable_params, total_params = print_trainable_parameters(teacher_model, label="Teacher (fully frozen)")
+        if trainable_params != 0:
+            raise RuntimeError(
+                f"Teacher model must be fully frozen but has {trainable_params:,} trainable "
+                f"parameters out of {total_params:,} total."
+            )
 
         return teacher_model
 
@@ -262,6 +270,7 @@ def _build_teacher_model_with_pp(
             cfg_qat=None,
             cfg_moe=dist_setup.moe_config,
             activation_checkpointing=dist_setup.activation_checkpointing,
+            skip_param_summary=True,
         )
 
     # Freeze all teacher parameters.
@@ -269,6 +278,13 @@ def _build_teacher_model_with_pp(
         part.eval()
         for p in part.parameters():
             p.requires_grad_(False)
+
+    trainable_params, total_params = print_trainable_parameters(teacher_model, label="Teacher (fully frozen)")
+    if trainable_params != 0:
+        raise RuntimeError(
+            f"Teacher model must be fully frozen but has {trainable_params:,} trainable "
+            f"parameters out of {total_params:,} total."
+        )
 
     # Attach capture reference so the recipe can read teacher logits after eval.
     teacher_model._teacher_logits_capture = teacher_logits_capture

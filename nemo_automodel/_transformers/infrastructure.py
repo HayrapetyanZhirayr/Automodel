@@ -354,6 +354,8 @@ def apply_model_infrastructure(
     pretrained_model_name_or_path="",
     weights_already_loaded=False,
     inject_te_attention: bool = False,
+    skip_param_summary: bool = False,
+    param_summary_label: str | None = None,
     **_kwargs,
 ):
     """Apply sharding, PEFT, quantization, and checkpoint loading to a model.
@@ -562,8 +564,8 @@ def apply_model_infrastructure(
                 if "lora_" not in name and param.requires_grad:
                     param.requires_grad_(False)
 
-    if autopipeline is None:
-        print_trainable_parameters(model)  # Once model's been sharded
+    if autopipeline is None and not skip_param_summary:
+        print_trainable_parameters(model, label=param_summary_label)  # Once model's been sharded
         # Ensure model is on the correct device.
         # Skip only when params are actually sharded (any DTensor in the model)
         # AND the checkpoint was loaded post-shard. Calling model.to(device) on
